@@ -9,49 +9,76 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
+	"github.com/ethan/nest-cloudflare-relay/pkg/config"
 	"github.com/ethan/nest-cloudflare-relay/pkg/nest"
+	"github.com/ethan/nest-cloudflare-relay/pkg/relay"
 )
 
-// Example demonstrating Phase 3: Rate-limited multi-camera coordination for 20 Nest cameras
+// Multi-camera relay example: Full pipeline for multiple cameras
+// Nest cameras → RTSP streams → RTP processing → WebRTC → Cloudflare
 func main() {
 	// Initialize logger
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	// Load credentials from environment
-	clientID := os.Getenv("GOOGLE_CLIENT_ID")
-	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
-	refreshToken := os.Getenv("GOOGLE_REFRESH_TOKEN")
-	projectID := os.Getenv("GOOGLE_PROJECT_ID")
+	logger.Info("starting multi-camera Nest → Cloudflare relay")
 
-	if clientID == "" || clientSecret == "" || refreshToken == "" || projectID == "" {
-		log.Fatal("Missing required environment variables")
+	// Load credentials from .env file
+	cfg, err := config.Load(".env")
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	// Create Nest API client
-	client := nest.NewClient(clientID, clientSecret, refreshToken, logger)
+	nestClient := nest.NewClient(
+		cfg.Google.ClientID,
+		cfg.Google.ClientSecret,
+		cfg.Google.RefreshToken,
+		logger.With("component", "nest"),
+	)
+
+	// Create Cloudflare client
+	cfClient := cloudflare.NewClient(
+		cfg.Cloudflare.AppID,
+		cfg.Cloudflare.APIToken,
+		logger.With("component", "cloudflare"),
+	)
 
 	// List available cameras
 	ctx := context.Background()
-	devices, err := client.ListDevices(ctx, projectID)
+	devices, err := nestClient.ListDevices(ctx, cfg.Google.ProjectID)
 	if err != nil {
 		log.Fatalf("Failed to list devices: %v", err)
 	}
 
 	logger.Info("discovered cameras", "count", len(devices))
 
-	// Extract camera IDs (limit to 20 for this example)
+	// Extract camera IDs (limit to first 20 for rate limiting)
 	cameraIDs := make([]string, 0, 20)
 	for i, device := range devices {
 		if i >= 20 {
 			break
 		}
 		cameraIDs = append(cameraIDs, device.DeviceID)
+
+		displayName := device.Traits.Info.CustomName
+		if displayName == "" && len(device.Relations) > 0 {
+			displayName = device.Relations[0].DisplayName
+		}
+		if displayName == "" {
+			displayName = device.DeviceID
+		}
+
 		logger.Info("camera available",
 			"index", i+1,
 			"device_id", device.DeviceID,
-			"name", device.Traits.Info.CustomName)
+			"name", displayName,
+			"protocols", device.Traits.CameraLiveStream.SupportedProtocols,
+			"video_codecs", device.Traits.CameraLiveStream.VideoCodecs,
+			"audio_codecs", device.Traits.CameraLiveStream.AudioCodecs,
+		)
 	}
 
 	if len(cameraIDs) == 0 {
@@ -59,34 +86,47 @@ func main() {
 	}
 
 	// Configure multi-stream manager with defaults for 20 cameras @ 10 QPM
-	config := nest.DefaultMultiStreamConfig()
+	msmConfig := nest.DefaultMultiStreamConfig()
 
 	// Create multi-stream manager
-	manager := nest.NewMultiStreamManager(client, projectID, config, logger)
+	streamMgr := nest.NewMultiStreamManager(
+		nestClient,
+		cfg.Google.ProjectID,
+		msmConfig,
+		logger.With("component", "stream_manager"),
+	)
 
-	// Start command queue
-	if err := manager.Start(); err != nil {
-		log.Fatalf("Failed to start manager: %v", err)
-	}
+	// Create multi-camera relay orchestrator
+	multiRelay := relay.NewMultiCameraRelay(
+		streamMgr,
+		cfClient,
+		logger.With("component", "multi_relay"),
+	)
 
-	logger.Info("multi-stream manager started",
+	logger.Info("multi-camera relay initialized",
 		"cameras", len(cameraIDs),
-		"qpm_limit", config.QPM,
-		"stagger_interval", config.StaggerInterval)
+		"qpm_limit", msmConfig.QPM,
+		"stagger_interval", msmConfig.StaggerInterval)
+
+	// Start the multi-relay (starts stream manager internally)
+	if err := multiRelay.Start(ctx); err != nil {
+		log.Fatalf("Failed to start multi-relay: %v", err)
+	}
 
 	// Start all cameras with staggered initialization
 	// This will take ~4 minutes for 20 cameras (20 * 12s stagger)
 	startCtx, startCancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer startCancel()
 
-	if err := manager.StartCameras(startCtx, cameraIDs); err != nil {
+	logger.Info("starting cameras with staggered initialization")
+	if err := streamMgr.StartCameras(startCtx, cameraIDs); err != nil {
 		log.Fatalf("Failed to start cameras: %v", err)
 	}
 
-	logger.Info("all cameras initialization triggered")
+	logger.Info("all cameras initialization triggered - relays will be created as streams become ready")
 
-	// Start status monitoring goroutine
-	go monitorStatus(manager, logger)
+	// Start monitoring goroutine
+	go monitorStatus(multiRelay, streamMgr, logger)
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
@@ -95,46 +135,58 @@ func main() {
 	logger.Info("running... press Ctrl+C to stop")
 	<-sigChan
 
-	logger.Info("shutdown signal received, stopping all streams")
+	logger.Info("shutdown signal received, stopping all relays")
 
-	// Graceful shutdown with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	if err := manager.Stop(); err != nil {
+	// Graceful shutdown
+	if err := multiRelay.Stop(); err != nil {
 		logger.Error("error during shutdown", "error", err)
 	}
 
-	// Wait for shutdown to complete
-	<-shutdownCtx.Done()
 	logger.Info("shutdown complete")
 }
 
-// monitorStatus periodically logs stream and queue status
-func monitorStatus(manager *nest.MultiStreamManager, logger *slog.Logger) {
-	ticker := time.NewTicker(60 * time.Second) // Report every minute
+// monitorStatus periodically logs stream and relay status
+func monitorStatus(multiRelay *relay.MultiCameraRelay, streamMgr *nest.MultiStreamManager, logger *slog.Logger) {
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		// Get stream statuses
-		statuses := manager.GetStreamStatus()
+		streamStatuses := streamMgr.GetStreamStatus()
 
-		// Count by state
-		stateCounts := make(map[nest.CameraState]int)
-		for _, status := range statuses {
-			stateCounts[status.State]++
+		// Count streams by state
+		streamStates := make(map[nest.CameraState]int)
+		for _, status := range streamStatuses {
+			streamStates[status.State]++
 		}
 
+		// Get relay stats
+		relayStats := multiRelay.GetRelayStats()
+		aggStats := multiRelay.GetAggregateStats()
+
 		// Get queue stats
-		queueStats := manager.GetQueueStats()
+		queueStats := streamMgr.GetQueueStats()
 
 		logger.Info("status report",
-			"total_cameras", len(statuses),
-			"state_starting", stateCounts[nest.StateStarting],
-			"state_running", stateCounts[nest.StateRunning],
-			"state_failed", stateCounts[nest.StateFailed],
-			"state_degraded", stateCounts[nest.StateDegraded],
-			"state_stopped", stateCounts[nest.StateStopped],
+			// Stream states
+			"total_cameras", len(streamStatuses),
+			"streams_starting", streamStates[nest.StateStarting],
+			"streams_running", streamStates[nest.StateRunning],
+			"streams_failed", streamStates[nest.StateFailed],
+			"streams_degraded", streamStates[nest.StateDegraded],
+			"streams_stopped", streamStates[nest.StateStopped],
+			// Relay states
+			"total_relays", aggStats.TotalRelays,
+			"relays_connected", aggStats.ConnectedRelays,
+			"relays_connecting", aggStats.ConnectingRelays,
+			"relays_failed", aggStats.FailedRelays,
+			"relays_disconnected", aggStats.DisconnectedRelays,
+			// Aggregate statistics
+			"total_video_packets", aggStats.TotalVideoPackets,
+			"total_video_frames", aggStats.TotalVideoFrames,
+			"total_audio_packets", aggStats.TotalAudioPackets,
+			"total_audio_frames", aggStats.TotalAudioFrames,
+			// Queue statistics
 			"queue_depth", queueStats.QueueDepth,
 			"total_executed", queueStats.TotalExecuted,
 			"total_failed", queueStats.TotalFailed,
@@ -144,59 +196,68 @@ func monitorStatus(manager *nest.MultiStreamManager, logger *slog.Logger) {
 		)
 
 		// Log individual camera issues
-		for _, status := range statuses {
-			if status.State == nest.StateFailed || status.State == nest.StateDegraded {
-				logger.Warn("camera issue detected",
-					"camera_id", status.CameraID,
-					"state", status.State.String(),
-					"failure_count", status.FailureCount,
-					"last_error", status.LastError,
-					"time_since_attempt", time.Since(status.LastAttempt),
+		for _, streamStatus := range streamStatuses {
+			if streamStatus.State == nest.StateFailed || streamStatus.State == nest.StateDegraded {
+				logger.Warn("camera stream issue",
+					"camera_id", streamStatus.CameraID,
+					"state", streamStatus.State.String(),
+					"failure_count", streamStatus.FailureCount,
+					"last_error", streamStatus.LastError,
+					"time_since_attempt", time.Since(streamStatus.LastAttempt),
 				)
-			} else if status.State == nest.StateRunning {
-				logger.Debug("camera healthy",
-					"camera_id", status.CameraID,
-					"time_until_expiry", status.TimeUntilExpiry,
-					"last_extension", time.Since(status.LastExtension),
+			}
+		}
+
+		// Log individual relay statistics
+		for _, stat := range relayStats {
+			if stat.WebRTCState != "connected" {
+				logger.Warn("relay connection issue",
+					"camera_id", stat.CameraID,
+					"session_id", stat.SessionID,
+					"webrtc_state", stat.WebRTCState,
+					"uptime", stat.Uptime,
 				)
 			}
 		}
 	}
 }
 
-// QPM Budget Analysis for 20 Cameras:
+// Architecture Notes:
 //
-// STEADY STATE (all cameras running):
-// - Each camera extends every ~4 minutes (240s stream lifetime, 60s buffer)
-// - 20 cameras ÷ 4 minutes = 5 QPM for extensions
-// - Reserve ~4 QPM for recovery operations
-// - 1 QPM safety margin
-// - Total: 10 QPM (at limit)
+// COMPONENT HIERARCHY:
+// MultiCameraRelay (orchestrator)
+//   ├─ MultiStreamManager (Nest stream lifecycle)
+//   │   ├─ CommandQueue (10 QPM rate limiting)
+//   │   └─ StreamManager per camera (auto-extension)
+//   │
+//   └─ CameraRelay per camera (media pipeline)
+//       ├─ RTSP client (TCP interleaved)
+//       ├─ RTP processors (H.264, AAC)
+//       └─ WebRTC bridge (Cloudflare)
 //
-// STARTUP:
-// - Staggered initialization: 12 seconds between cameras
-// - 20 cameras × 12s = 240 seconds (4 minutes total)
-// - Spread across 4 minutes = 5 QPM during startup
-// - Well within 10 QPM limit
+// LIFECYCLE:
+// 1. MultiStreamManager starts cameras with 12s stagger
+// 2. Each stream → StateStarting → StateRunning
+// 3. MultiCameraRelay detects StateRunning → creates CameraRelay
+// 4. CameraRelay connects RTSP → processes RTP → sends to Cloudflare
+// 5. MultiStreamManager auto-extends streams every 180s
+// 6. If RTSP disconnect → MultiStreamManager regenerates stream
+// 7. If WebRTC disconnect → MultiCameraRelay recreates relay
 //
-// RECOVERY SCENARIOS:
-// - Failed streams marked degraded after 5 failures
-// - Degraded cameras retry every 5 minutes
-// - Priority queue ensures extensions always take precedence
-// - "Save the Living Before Resurrecting the Dead"
+// RATE LIMITING:
+// - 20 cameras × 1 generate = 20 queries (staggered over 4 minutes = 5 QPM)
+// - 20 cameras ÷ 4 minutes = 5 extensions per minute (steady state)
+// - Total: ~10 QPM (at Google's limit)
+// - Priority queue: extensions (HIGH) > generates (LOW)
 //
-// Example Timeline (3 cameras):
-// T=0s:    Camera1 generates (queue: 1, executed: 0)
-// T=12s:   Camera2 generates (queue: 1, executed: 1)
-// T=24s:   Camera3 generates (queue: 1, executed: 2)
-// T=240s:  Camera1 extends   (queue: 1, executed: 3) [HIGH priority]
-// T=252s:  Camera2 extends   (queue: 1, executed: 4) [HIGH priority]
-// T=264s:  Camera3 extends   (queue: 1, executed: 5) [HIGH priority]
-// T=480s:  Camera1 extends   (queue: 1, executed: 6) [HIGH priority]
-// ...continues indefinitely
+// ERROR RECOVERY:
+// - Stream expired → regenerate (exponential backoff, max 5 retries)
+// - Too many failures → degraded state (5 minute retry interval)
+// - RTSP disconnect → stream manager handles regeneration
+// - WebRTC disconnect → relay recreates Cloudflare session
 //
-// If Camera2 fails to extend at T=252s:
-// - Marked as failed, retry scheduled with backoff
-// - Recovery attempt uses LOW priority (CmdGenerate)
-// - Camera1 and Camera3 extensions still get HIGH priority
-// - After 5 failures, Camera2 marked degraded (5min retry interval)
+// GRACEFUL SHUTDOWN:
+// 1. Stop MultiCameraRelay (stops all relays + stream manager)
+// 2. Each CameraRelay: cancel context → close RTSP → wait goroutines → close WebRTC
+// 3. MultiStreamManager: stop all stream managers → stop queue
+// 4. Clean exit with no goroutine leaks
