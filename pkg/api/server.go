@@ -7,9 +7,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
 	"github.com/ethan/nest-cloudflare-relay/pkg/relay"
 )
 
@@ -19,6 +21,7 @@ var webFS embed.FS
 // Server provides HTTP API for camera session discovery and web viewer
 type Server struct {
 	relay       *relay.MultiCameraRelay
+	cfClient    *cloudflare.Client
 	appID       string
 	logger      *slog.Logger
 	httpServer  *http.Server
@@ -43,11 +46,13 @@ type ConfigResponse struct {
 // NewServer creates a new API server
 func NewServer(
 	relay *relay.MultiCameraRelay,
+	cfClient *cloudflare.Client,
 	appID string,
 	logger *slog.Logger,
 ) *Server {
 	return &Server{
 		relay:       relay,
+		cfClient:    cfClient,
 		appID:       appID,
 		logger:      logger,
 		cameraNames: make(map[string]string),
@@ -68,6 +73,10 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	// API endpoints
 	mux.HandleFunc("/api/cameras", s.handleGetCameras)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
+
+	// Cloudflare proxy endpoints (authenticated on backend)
+	mux.HandleFunc("/api/cf/sessions/new", s.handleCreateSession)
+	mux.HandleFunc("/api/cf/sessions/", s.handleSessionOperation)
 
 	// Static file server for viewer using embedded filesystem
 	staticFS, err := fs.Sub(webFS, "web/static")
@@ -244,4 +253,117 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// handleCreateSession proxies session creation requests to Cloudflare
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Create session via Cloudflare client (authenticated)
+	resp, err := s.cfClient.CreateSession(ctx)
+	if err != nil {
+		s.logger.Error("failed to create session", "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return response to frontend
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleSessionOperation routes session-specific operations
+func (s *Server) handleSessionOperation(w http.ResponseWriter, r *http.Request) {
+	// Parse session ID from URL: /api/cf/sessions/{sessionId}/...
+	path := strings.TrimPrefix(r.URL.Path, "/api/cf/sessions/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		http.Error(w, "invalid session path", http.StatusBadRequest)
+		return
+	}
+
+	sessionID := parts[0]
+	operation := parts[1]
+
+	switch operation {
+	case "tracks":
+		if len(parts) >= 3 && parts[2] == "new" {
+			s.handleAddTracks(w, r, sessionID)
+		} else {
+			http.Error(w, "invalid tracks operation", http.StatusBadRequest)
+		}
+	case "renegotiate":
+		s.handleRenegotiate(w, r, sessionID)
+	default:
+		http.Error(w, "unknown operation", http.StatusNotFound)
+	}
+}
+
+// handleAddTracks proxies track addition requests to Cloudflare
+func (s *Server) handleAddTracks(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Parse request body
+	var req cloudflare.TracksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.logger.Error("failed to parse tracks request", "error", err)
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Add tracks via Cloudflare client (authenticated)
+	resp, err := s.cfClient.AddTracks(ctx, sessionID, &req)
+	if err != nil {
+		s.logger.Error("failed to add tracks",
+			"session_id", sessionID,
+			"error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return response to frontend
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleRenegotiate proxies renegotiation requests to Cloudflare
+func (s *Server) handleRenegotiate(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Parse request body
+	var req cloudflare.RenegotiateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.logger.Error("failed to parse renegotiate request", "error", err)
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Renegotiate via Cloudflare client (authenticated)
+	resp, err := s.cfClient.Renegotiate(ctx, sessionID, &req)
+	if err != nil {
+		s.logger.Error("failed to renegotiate",
+			"session_id", sessionID,
+			"error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return response to frontend
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }

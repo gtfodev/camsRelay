@@ -114,6 +114,7 @@ func main() {
 	// Create and start HTTP API server for viewer FIRST (before camera init)
 	apiServer := api.NewServer(
 		multiRelay,
+		cfClient,
 		cfg.Cloudflare.AppID,
 		logger.With("component", "api"),
 	)
