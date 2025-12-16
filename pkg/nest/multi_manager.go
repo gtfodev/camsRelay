@@ -520,6 +520,17 @@ func (msm *MultiStreamManager) GetQueueStats() QueueStats {
 	return msm.queue.GetStats()
 }
 
+// GetStream returns the RTSP stream for a specific camera
+func (msm *MultiStreamManager) GetStream(cameraID string) *RTSPStream {
+	msm.mu.RLock()
+	defer msm.mu.RUnlock()
+
+	if stream, exists := msm.streams[cameraID]; exists && stream.Manager != nil {
+		return stream.Manager.GetStream()
+	}
+	return nil
+}
+
 // updateStreamState safely updates stream state with a mutation function
 func (msm *MultiStreamManager) updateStreamState(cameraID string, fn func(*CameraStream)) {
 	msm.mu.Lock()
@@ -533,12 +544,12 @@ func (msm *MultiStreamManager) updateStreamState(cameraID string, fn func(*Camer
 // extractCameraDeviceID extracts device ID from camera ID
 // Format: enterprises/{project}/devices/{deviceId}
 func extractCameraDeviceID(cameraID string) string {
-	// If already just the device ID, return as-is
-	if len(cameraID) < 30 {
-		return cameraID
+	// If it's a full path (contains "/devices/"), extract the device ID
+	if contains(cameraID, "/devices/") {
+		return extractDeviceID(cameraID)
 	}
-	// Otherwise extract from full name
-	return extractDeviceID(cameraID)
+	// Otherwise, it's already just the device ID
+	return cameraID
 }
 
 // isStreamExpiredError checks if error indicates stream expiration (404)
