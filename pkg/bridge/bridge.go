@@ -31,6 +31,10 @@ type Bridge struct {
 	videoSeqNum   uint16
 	videoTS       uint32
 	videoMu       sync.Mutex // Protects sequence number and timestamp
+
+	// Cached connection state (to avoid blocking on pc.ConnectionState())
+	connStateMu    sync.RWMutex
+	cachedConnState webrtc.PeerConnectionState
 }
 
 // NewBridge creates a new WebRTC bridge to Cloudflare
@@ -38,12 +42,13 @@ func NewBridge(ctx context.Context, cfClient *cloudflare.Client, logger *slog.Lo
 	ctx, cancel := context.WithCancel(ctx)
 
 	b := &Bridge{
-		logger:        logger,
-		cfClient:      cfClient,
-		ctx:           ctx,
-		cancel:        cancel,
-		h264Payloader: &codecs.H264Payloader{},
-		videoSeqNum:   uint16(time.Now().UnixNano() & 0xFFFF), // Random starting sequence number
+		logger:          logger,
+		cfClient:        cfClient,
+		ctx:             ctx,
+		cancel:          cancel,
+		h264Payloader:   &codecs.H264Payloader{},
+		videoSeqNum:     uint16(time.Now().UnixNano() & 0xFFFF), // Random starting sequence number
+		cachedConnState: webrtc.PeerConnectionStateNew,          // Initial state
 	}
 
 	return b, nil
@@ -104,6 +109,14 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 		return fmt.Errorf("create peer connection: %w", err)
 	}
 	b.pc = pc
+
+	// Set up connection state change handler to cache state
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		b.connStateMu.Lock()
+		b.cachedConnState = state
+		b.connStateMu.Unlock()
+		b.logger.Info("peer connection state changed", "state", state.String())
+	})
 
 	// Create video track
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
@@ -348,12 +361,12 @@ func (b *Bridge) GetSessionID() string {
 	return b.sessionID
 }
 
-// GetConnectionState returns the peer connection state
+// GetConnectionState returns the cached peer connection state
+// This uses the cached value to avoid blocking on pc.ConnectionState()
 func (b *Bridge) GetConnectionState() webrtc.PeerConnectionState {
-	if b.pc == nil {
-		return webrtc.PeerConnectionStateNew
-	}
-	return b.pc.ConnectionState()
+	b.connStateMu.RLock()
+	defer b.connStateMu.RUnlock()
+	return b.cachedConnState
 }
 
 // Close closes the bridge and all resources

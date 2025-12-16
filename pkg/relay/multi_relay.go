@@ -120,10 +120,13 @@ func (mcr *MultiCameraRelay) monitorStreamsLoop() {
 func (mcr *MultiCameraRelay) reconcileRelays() {
 	statuses := mcr.streamMgr.GetStreamStatus()
 
-	mcr.mu.Lock()
-	defer mcr.mu.Unlock()
+	// First pass: identify relays to create (without holding lock for long)
+	var toCreate []struct {
+		cameraID string
+		deviceID string
+	}
 
-	// Check each stream status
+	mcr.mu.Lock()
 	for _, status := range statuses {
 		cameraID := status.CameraID
 
@@ -146,13 +149,12 @@ func (mcr *MultiCameraRelay) reconcileRelays() {
 			continue
 		}
 
-		// If relay doesn't exist for running stream, create it
+		// If relay doesn't exist for running stream, mark for creation
 		if _, exists := mcr.relays[cameraID]; !exists {
-			mcr.logger.Info("creating relay for running stream", "camera_id", cameraID)
-
-			if err := mcr.createRelayForStream(cameraID, status.DeviceID); err != nil {
-				mcr.logger.Error("failed to create relay", "camera_id", cameraID, "error", err)
-			}
+			toCreate = append(toCreate, struct {
+				cameraID string
+				deviceID string
+			}{cameraID, status.DeviceID})
 		}
 	}
 
@@ -176,6 +178,15 @@ func (mcr *MultiCameraRelay) reconcileRelays() {
 			}(relay)
 
 			delete(mcr.relays, cameraID)
+		}
+	}
+	mcr.mu.Unlock()
+
+	// Second pass: create relays (without holding lock - slow operation)
+	for _, item := range toCreate {
+		mcr.logger.Info("creating relay for running stream", "camera_id", item.cameraID)
+		if err := mcr.createRelayForStream(item.cameraID, item.deviceID); err != nil {
+			mcr.logger.Error("failed to create relay", "camera_id", item.cameraID, "error", err)
 		}
 	}
 }
@@ -235,8 +246,10 @@ func (mcr *MultiCameraRelay) createRelayForStream(cameraID, deviceID string) err
 		return fmt.Errorf("start relay: %w", err)
 	}
 
-	// Store relay
+	// Store relay (acquire lock for map write)
+	mcr.mu.Lock()
 	mcr.relays[cameraID] = relay
+	mcr.mu.Unlock()
 
 	mcr.logger.Info("relay created and started", "camera_id", cameraID)
 	return nil

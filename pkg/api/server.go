@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -140,39 +141,77 @@ func (s *Server) handleGetCameras(w http.ResponseWriter, r *http.Request) {
 	cameras := make([]CameraInfo, 0)
 
 	if s.relay != nil {
-		stats := s.relay.GetRelayStats()
-
-		s.mu.RLock()
-		cameras = make([]CameraInfo, 0, len(stats)*2) // *2 for video and audio tracks
-		for _, stat := range stats {
-			name := s.cameraNames[stat.CameraID]
-			if name == "" {
-				name = stat.CameraID
-			}
-
-			// Video track
-			cameras = append(cameras, CameraInfo{
-				CameraID:  stat.CameraID,
-				SessionID: stat.SessionID,
-				TrackName: "video",
-				Name:      name,
-				Kind:      "video",
-			})
-
-			// Audio track
-			cameras = append(cameras, CameraInfo{
-				CameraID:  stat.CameraID,
-				SessionID: stat.SessionID,
-				TrackName: "audio",
-				Name:      name,
-				Kind:      "audio",
-			})
+		// Use a timeout channel to prevent blocking indefinitely
+		type statsResult struct {
+			stats []relay.RelayStats
+			err   error
 		}
-		s.mu.RUnlock()
+		statsChan := make(chan statsResult, 1)
+
+		// Fetch stats in goroutine with timeout protection
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error("panic in GetRelayStats", "panic", r)
+					statsChan <- statsResult{err: fmt.Errorf("panic: %v", r)}
+				}
+			}()
+			stats := s.relay.GetRelayStats()
+			statsChan <- statsResult{stats: stats}
+		}()
+
+		// Wait for stats with timeout
+		var stats []relay.RelayStats
+		select {
+		case result := <-statsChan:
+			if result.err != nil {
+				s.logger.Error("failed to get relay stats", "error", result.err)
+				// Return empty array on error
+				stats = nil
+			} else {
+				stats = result.stats
+			}
+		case <-time.After(5 * time.Second):
+			s.logger.Error("timeout getting relay stats")
+			// Return empty array on timeout
+			stats = nil
+		}
+
+		if stats != nil {
+			s.mu.RLock()
+			cameras = make([]CameraInfo, 0, len(stats)*2) // *2 for video and audio tracks
+			for _, stat := range stats {
+				name := s.cameraNames[stat.CameraID]
+				if name == "" {
+					name = stat.CameraID
+				}
+
+				// Video track
+				cameras = append(cameras, CameraInfo{
+					CameraID:  stat.CameraID,
+					SessionID: stat.SessionID,
+					TrackName: "video",
+					Name:      name,
+					Kind:      "video",
+				})
+
+				// Audio track
+				cameras = append(cameras, CameraInfo{
+					CameraID:  stat.CameraID,
+					SessionID: stat.SessionID,
+					TrackName: "audio",
+					Name:      name,
+					Kind:      "audio",
+				})
+			}
+			s.mu.RUnlock()
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(cameras)
+	if err := json.NewEncoder(w).Encode(cameras); err != nil {
+		s.logger.Error("failed to encode cameras response", "error", err)
+	}
 }
 
 // handleGetConfig returns Cloudflare configuration
