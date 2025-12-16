@@ -49,3 +49,6 @@ coverage.html
 
 # Binaries directory
 /bin/
+
+# Serena MCP
+.serena/
