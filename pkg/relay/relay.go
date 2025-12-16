@@ -97,6 +97,15 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 		"session_id", r.webrtcBridge.GetSessionID(),
 		"state", r.webrtcBridge.GetConnectionState().String())
 
+	// Wait for PeerConnection to reach "connected" state before starting RTSP
+	// This ensures ICE connectivity is fully established before we start sending RTP packets
+	// Without this, we may send packets before the peer connection is ready, causing them to be dropped
+	r.logger.Info("waiting for WebRTC connection to be established")
+	if err := r.waitForConnection(ctx); err != nil {
+		return fmt.Errorf("wait for WebRTC connection: %w", err)
+	}
+	r.logger.Info("WebRTC connection established, starting RTSP stream")
+
 	// Create RTSP client
 	r.rtspConn = rtspClient.NewClient(r.stream.URL, r.logger.With("component", "rtsp"))
 
@@ -112,18 +121,30 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 	// Setup H.264 frame handler
 	r.h264Proc.OnFrame = func(nalus []byte, keyframe bool) {
 		r.videoFrameCount.Add(1)
+		frameCount := r.videoFrameCount.Load()
 
 		// Write to WebRTC bridge with fixed 33ms duration (30fps)
 		if err := r.webrtcBridge.WriteVideoSample(nalus, 33*time.Millisecond); err != nil {
-			r.logger.Warn("failed to write video sample", "error", err)
-		}
-
-		frameCount := r.videoFrameCount.Load()
-		if frameCount%300 == 0 { // Log every 10 seconds @ 30fps
-			r.logger.Debug("video frames written",
+			r.logger.Error("failed to write video sample",
 				"frame_count", frameCount,
 				"keyframe", keyframe,
-				"size_bytes", len(nalus))
+				"connection_state", r.webrtcBridge.GetConnectionState().String(),
+				"error", err)
+			return
+		}
+
+		// Log successful writes periodically
+		if frameCount == 1 {
+			r.logger.Info("first video frame written successfully",
+				"keyframe", keyframe,
+				"size_bytes", len(nalus),
+				"connection_state", r.webrtcBridge.GetConnectionState().String())
+		} else if frameCount%300 == 0 { // Log every 10 seconds @ 30fps
+			r.logger.Info("video frames written",
+				"frame_count", frameCount,
+				"keyframe", keyframe,
+				"size_bytes", len(nalus),
+				"connection_state", r.webrtcBridge.GetConnectionState().String())
 		}
 	}
 
@@ -176,6 +197,35 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 	go r.readLoop()
 
 	return nil
+}
+
+// waitForConnection waits for the WebRTC peer connection to reach "connected" state
+func (r *CameraRelay) waitForConnection(ctx context.Context) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timeout waiting for connection (state=%s): %w",
+				r.webrtcBridge.GetConnectionState().String(), waitCtx.Err())
+		case <-ticker.C:
+			state := r.webrtcBridge.GetConnectionState()
+			r.logger.Debug("checking connection state", "state", state.String())
+
+			if state.String() == "connected" {
+				return nil
+			}
+
+			// Fail fast if connection failed
+			if state.String() == "failed" || state.String() == "closed" {
+				return fmt.Errorf("peer connection failed: state=%s", state.String())
+			}
+		}
+	}
 }
 
 // Stop gracefully stops the relay

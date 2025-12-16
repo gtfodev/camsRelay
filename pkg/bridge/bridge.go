@@ -302,7 +302,14 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 			if err == io.ErrClosedPipe {
 				return nil // Track closed gracefully
 			}
-			return fmt.Errorf("write RTP packet %d/%d: %w", i+1, len(payloads), err)
+			// Log connection state on write error to diagnose timing issues
+			b.logger.Error("failed to write RTP packet",
+				"packet_num", i+1,
+				"total_packets", len(payloads),
+				"connection_state", b.GetConnectionState().String(),
+				"error", err)
+			return fmt.Errorf("write RTP packet %d/%d (state=%s): %w",
+				i+1, len(payloads), b.GetConnectionState().String(), err)
 		}
 
 		// Increment sequence number for next packet
