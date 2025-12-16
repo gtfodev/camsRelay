@@ -10,6 +10,7 @@ import (
 
 	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -24,6 +25,12 @@ type Bridge struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+
+	// H.264 RTP packetization
+	h264Payloader *codecs.H264Payloader
+	videoSeqNum   uint16
+	videoTS       uint32
+	videoMu       sync.Mutex // Protects sequence number and timestamp
 }
 
 // NewBridge creates a new WebRTC bridge to Cloudflare
@@ -31,10 +38,12 @@ func NewBridge(ctx context.Context, cfClient *cloudflare.Client, logger *slog.Lo
 	ctx, cancel := context.WithCancel(ctx)
 
 	b := &Bridge{
-		logger:   logger,
-		cfClient: cfClient,
-		ctx:      ctx,
-		cancel:   cancel,
+		logger:        logger,
+		cfClient:      cfClient,
+		ctx:           ctx,
+		cancel:        cancel,
+		h264Payloader: &codecs.H264Payloader{},
+		videoSeqNum:   uint16(time.Now().UnixNano() & 0xFFFF), // Random starting sequence number
 	}
 
 	return b, nil
@@ -243,26 +252,59 @@ func (b *Bridge) WriteVideoRTP(packet *rtp.Packet) error {
 	return nil
 }
 
-// WriteVideoSample writes H.264 video data as a sample
+// WriteVideoSample writes H.264 video data as a sample with proper RTP packetization
 func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 	if b.videoTrack == nil {
 		return fmt.Errorf("video track not initialized")
 	}
 
-	// For StaticRTP, we need to packetize ourselves
-	// For now, just create a basic RTP packet
-	// In production, this would use proper H264 packetization
-	packet := &rtp.Packet{
-		Header: rtp.Header{
-			Version:        2,
-			PayloadType:    96,
-			SequenceNumber: uint16(time.Now().UnixNano() & 0xFFFF),
-			Timestamp:      uint32(time.Now().UnixNano() / 1000000),
-		},
-		Payload: data,
+	b.videoMu.Lock()
+	defer b.videoMu.Unlock()
+
+	// Use H264Payloader to fragment NAL unit into MTU-sized RTP packets
+	// MTU is set to 1200 bytes (safe for WebRTC with overhead for RTP/UDP/IP headers)
+	const mtu = 1200
+	payloads := b.h264Payloader.Payload(mtu, data)
+
+	// Get current timestamp and sequence number
+	timestamp := b.videoTS
+	seqNum := b.videoSeqNum
+
+	// Write each fragmented payload as a separate RTP packet
+	for i, payload := range payloads {
+		// Create RTP packet
+		packet := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    96, // H.264 payload type
+				SequenceNumber: seqNum,
+				Timestamp:      timestamp,
+				Marker:         i == len(payloads)-1, // Mark last packet in frame
+			},
+			Payload: payload,
+		}
+
+		// Write packet to track
+		if err := b.videoTrack.WriteRTP(packet); err != nil {
+			if err == io.ErrClosedPipe {
+				return nil // Track closed gracefully
+			}
+			return fmt.Errorf("write RTP packet %d/%d: %w", i+1, len(payloads), err)
+		}
+
+		// Increment sequence number for next packet
+		seqNum++
 	}
 
-	return b.WriteVideoRTP(packet)
+	// Update sequence number and timestamp for next sample
+	b.videoSeqNum = seqNum
+
+	// Increment timestamp based on duration (90kHz clock for H.264)
+	// duration is in nanoseconds, convert to 90kHz ticks
+	timestampIncrement := uint32(duration.Nanoseconds() * 90000 / 1e9)
+	b.videoTS += timestampIncrement
+
+	return nil
 }
 
 // WriteAudioRTP writes an audio RTP packet to the WebRTC track
