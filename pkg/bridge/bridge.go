@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
@@ -22,6 +23,8 @@ type Bridge struct {
 	pc          *webrtc.PeerConnection
 	videoTrack  *webrtc.TrackLocalStaticRTP
 	audioTrack  *webrtc.TrackLocalStaticRTP
+	videoSender *webrtc.RTPSender // RTCP reader for video track
+	audioSender *webrtc.RTPSender // RTCP reader for audio track
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -132,9 +135,11 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 	}
 	b.videoTrack = videoTrack
 
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	videoSender, err := pc.AddTrack(videoTrack)
+	if err != nil {
 		return fmt.Errorf("add video track: %w", err)
 	}
+	b.videoSender = videoSender
 
 	// Create audio track
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
@@ -151,11 +156,16 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 	}
 	b.audioTrack = audioTrack
 
-	if _, err = pc.AddTrack(audioTrack); err != nil {
+	audioSender, err := pc.AddTrack(audioTrack)
+	if err != nil {
 		return fmt.Errorf("add audio track: %w", err)
 	}
+	b.audioSender = audioSender
 
 	b.logger.Info("WebRTC peer connection created with tracks")
+
+	// Start RTCP reader goroutines
+	b.startRTCPReaders()
 
 	return nil
 }
@@ -374,6 +384,83 @@ func (b *Bridge) GetConnectionState() webrtc.PeerConnectionState {
 	b.connStateMu.RLock()
 	defer b.connStateMu.RUnlock()
 	return b.cachedConnState
+}
+
+// startRTCPReaders spawns goroutines to read RTCP feedback from Cloudflare
+func (b *Bridge) startRTCPReaders() {
+	// Video track RTCP reader
+	if b.videoSender != nil {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.readRTCP(b.videoSender, "video")
+		}()
+	}
+
+	// Audio track RTCP reader
+	if b.audioSender != nil {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.readRTCP(b.audioSender, "audio")
+		}()
+	}
+}
+
+// readRTCP reads RTCP packets from an RTPSender and logs feedback
+func (b *Bridge) readRTCP(sender *webrtc.RTPSender, trackType string) {
+	b.logger.Info("[rtcp:reader] started", "track", trackType)
+
+	for {
+		// Read RTCP packets with context cancellation check
+		packets, _, err := sender.ReadRTCP()
+		if err != nil {
+			select {
+			case <-b.ctx.Done():
+				b.logger.Info("[rtcp:reader] stopped (context cancelled)", "track", trackType)
+				return
+			default:
+				if err == io.EOF || err == io.ErrClosedPipe {
+					b.logger.Info("[rtcp:reader] stopped (track closed)", "track", trackType)
+					return
+				}
+				b.logger.Error("[rtcp:reader] read error", "track", trackType, "error", err)
+				return
+			}
+		}
+
+		// Process received RTCP packets
+		for _, packet := range packets {
+			switch pkt := packet.(type) {
+			case *rtcp.PictureLossIndication:
+				b.logger.Warn("RTCP PLI received - viewer requesting keyframe",
+					"track", trackType,
+					"media_ssrc", pkt.MediaSSRC,
+					"sender_ssrc", pkt.SenderSSRC)
+
+			case *rtcp.FullIntraRequest:
+				b.logger.Warn("RTCP FIR received - viewer requesting keyframe",
+					"track", trackType,
+					"media_ssrc", pkt.MediaSSRC)
+
+			case *rtcp.ReceiverEstimatedMaximumBitrate:
+				b.logger.Debug("RTCP REMB received",
+					"track", trackType,
+					"bitrate_bps", pkt.Bitrate)
+
+			case *rtcp.ReceiverReport:
+				b.logger.Debug("RTCP RR received",
+					"track", trackType,
+					"ssrc", pkt.SSRC,
+					"reports", len(pkt.Reports))
+
+			default:
+				b.logger.Debug("RTCP packet received",
+					"track", trackType,
+					"type", fmt.Sprintf("%T", packet))
+			}
+		}
+	}
 }
 
 // Close closes the bridge and all resources
