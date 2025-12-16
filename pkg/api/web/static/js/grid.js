@@ -76,22 +76,104 @@ class CameraTile {
 
     attachStream(stream) {
         console.log(`[Tile ${this.cameraId}] Attaching stream`);
+
+        // Diagnostic: Check stream state
+        console.log(`[Tile ${this.cameraId}] Stream properties:`, {
+            id: stream.id,
+            active: stream.active,
+            trackCount: stream.getTracks().length
+        });
+
+        // Diagnostic: Log each track
+        const tracks = stream.getTracks();
+        tracks.forEach((track, idx) => {
+            console.log(`[Tile ${this.cameraId}] Track ${idx}:`, {
+                kind: track.kind,
+                id: track.id,
+                label: track.label,
+                enabled: track.enabled,
+                muted: track.muted,
+                readyState: track.readyState
+            });
+        });
+
         this.videoElement.srcObject = stream;
 
-        // Hide placeholder once video starts playing
+        // Add all video element event handlers for diagnostics
+        this.videoElement.onloadstart = () => {
+            console.log(`[Tile ${this.cameraId}] Video loadstart event`);
+        };
+
         this.videoElement.onloadedmetadata = () => {
-            console.log(`[Tile ${this.cameraId}] Video metadata loaded`);
+            console.log(`[Tile ${this.cameraId}] Video metadata loaded`, {
+                videoWidth: this.videoElement.videoWidth,
+                videoHeight: this.videoElement.videoHeight,
+                readyState: this.videoElement.readyState,
+                networkState: this.videoElement.networkState
+            });
             const placeholder = this.element.querySelector('.video-placeholder');
             if (placeholder) {
                 placeholder.style.display = 'none';
             }
         };
 
-        // Handle video errors
+        this.videoElement.onloadeddata = () => {
+            console.log(`[Tile ${this.cameraId}] Video data loaded`);
+        };
+
+        this.videoElement.oncanplay = () => {
+            console.log(`[Tile ${this.cameraId}] Video can play`);
+        };
+
+        this.videoElement.oncanplaythrough = () => {
+            console.log(`[Tile ${this.cameraId}] Video can play through`);
+        };
+
+        this.videoElement.onplaying = () => {
+            console.log(`[Tile ${this.cameraId}] Video playing`);
+        };
+
+        this.videoElement.onstalled = () => {
+            console.warn(`[Tile ${this.cameraId}] Video stalled`);
+        };
+
+        this.videoElement.onsuspend = () => {
+            console.warn(`[Tile ${this.cameraId}] Video suspended`);
+        };
+
+        this.videoElement.onwaiting = () => {
+            console.warn(`[Tile ${this.cameraId}] Video waiting`);
+        };
+
         this.videoElement.onerror = (error) => {
             console.error(`[Tile ${this.cameraId}] Video error:`, error);
+            console.error(`[Tile ${this.cameraId}] Video element state:`, {
+                error: this.videoElement.error,
+                readyState: this.videoElement.readyState,
+                networkState: this.videoElement.networkState
+            });
             this.setError('Video playback error');
         };
+
+        // Explicitly try to play
+        this.videoElement.play().then(() => {
+            console.log(`[Tile ${this.cameraId}] Play promise resolved`);
+        }).catch((err) => {
+            console.error(`[Tile ${this.cameraId}] Play promise rejected:`, err);
+        });
+
+        // Monitor track state changes
+        tracks.forEach((track, idx) => {
+            track.onended = () => {
+                console.warn(`[Tile ${this.cameraId}] Track ${idx} ended`);
+            };
+            track.onmute = () => {
+                console.warn(`[Tile ${this.cameraId}] Track ${idx} muted`);
+            };
+            track.onunmute = () => {
+                console.log(`[Tile ${this.cameraId}] Track ${idx} unmuted`);
+            };
+        });
     }
 
     setStatus(status) {
