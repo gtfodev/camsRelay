@@ -1,7 +1,7 @@
-# Binaries
-relay
-cmd/relay/relay
-cmd/verify/verify
+# Binaries (executables only, not directories)
+/relay
+/cmd/relay/relay
+/cmd/verify/verify
 *.exe
 *.dll
 *.so
