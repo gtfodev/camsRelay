@@ -127,7 +127,7 @@ export class Viewer {
 class CameraConnection {
     constructor(cameraData, appId, grid) {
         this.cameraData = cameraData;
-        this.appId = appId;
+        this.appId = appId; // No longer used (kept for backward compat)
         this.grid = grid;
         this.pc = null;
         this.tile = null;
@@ -207,8 +207,8 @@ class CameraConnection {
     }
 
     async createViewerSession() {
-        const url = `https://rtc.live.cloudflare.com/v1/apps/${this.appId}/sessions/new`;
-        const response = await fetch(url, {
+        // Call backend proxy instead of Cloudflare directly
+        const response = await fetch('/api/cf/sessions/new', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -229,7 +229,8 @@ class CameraConnection {
     }
 
     async pullRemoteTracks() {
-        const url = `https://rtc.live.cloudflare.com/v1/apps/${this.appId}/sessions/${this.sessionId}/tracks/new`;
+        // Call backend proxy instead of Cloudflare directly
+        const url = `/api/cf/sessions/${this.sessionId}/tracks/new`;
 
         // Pull video and audio tracks from producer session
         const tracks = this.cameraData.tracks.map(track => ({
@@ -264,7 +265,8 @@ class CameraConnection {
     }
 
     async renegotiate(answerSdp) {
-        const url = `https://rtc.live.cloudflare.com/v1/apps/${this.appId}/sessions/${this.sessionId}/renegotiate`;
+        // Call backend proxy instead of Cloudflare directly
+        const url = `/api/cf/sessions/${this.sessionId}/renegotiate`;
 
         const response = await fetch(url, {
             method: 'PUT',
