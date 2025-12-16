@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethan/nest-cloudflare-relay/pkg/api"
 	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
 	"github.com/ethan/nest-cloudflare-relay/pkg/config"
 	"github.com/ethan/nest-cloudflare-relay/pkg/nest"
@@ -57,6 +58,7 @@ func main() {
 
 	// Extract camera IDs (limit to first 20 for rate limiting)
 	cameraIDs := make([]string, 0, 20)
+	cameraNames := make(map[string]string) // Map device ID to display name
 	for i, device := range devices {
 		if i >= 20 {
 			break
@@ -70,6 +72,7 @@ func main() {
 		if displayName == "" {
 			displayName = device.DeviceID
 		}
+		cameraNames[device.DeviceID] = displayName
 
 		logger.Info("camera available",
 			"index", i+1,
@@ -125,6 +128,25 @@ func main() {
 
 	logger.Info("all cameras initialization triggered - relays will be created as streams become ready")
 
+	// Create and start HTTP API server for viewer
+	apiServer := api.NewServer(
+		multiRelay,
+		cfg.Cloudflare.AppID,
+		logger.With("component", "api"),
+	)
+
+	// Set camera display names in the API server
+	for deviceID, name := range cameraNames {
+		apiServer.SetCameraName(deviceID, name)
+	}
+
+	// Start HTTP server
+	if err := apiServer.Start(ctx, ":8080"); err != nil {
+		log.Fatalf("Failed to start API server: %v", err)
+	}
+
+	logger.Info("API server started", "address", "http://localhost:8080")
+
 	// Start monitoring goroutine
 	go monitorStatus(multiRelay, streamMgr, logger)
 
@@ -138,6 +160,15 @@ func main() {
 	logger.Info("shutdown signal received, stopping all relays")
 
 	// Graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// Stop API server
+	if err := apiServer.Stop(shutdownCtx); err != nil {
+		logger.Error("error stopping API server", "error", err)
+	}
+
+	// Stop relay
 	if err := multiRelay.Stop(); err != nil {
 		logger.Error("error during shutdown", "error", err)
 	}
@@ -230,10 +261,15 @@ func monitorStatus(multiRelay *relay.MultiCameraRelay, streamMgr *nest.MultiStre
 //   │   ├─ CommandQueue (10 QPM rate limiting)
 //   │   └─ StreamManager per camera (auto-extension)
 //   │
-//   └─ CameraRelay per camera (media pipeline)
-//       ├─ RTSP client (TCP interleaved)
-//       ├─ RTP processors (H.264, AAC)
-//       └─ WebRTC bridge (Cloudflare)
+//   ├─ CameraRelay per camera (media pipeline)
+//   │   ├─ RTSP client (TCP interleaved)
+//   │   ├─ RTP processors (H.264, AAC)
+//   │   └─ WebRTC bridge (Cloudflare - producer)
+//   │
+//   └─ API Server (HTTP endpoints + web viewer)
+//       ├─ GET /api/cameras (session discovery)
+//       ├─ GET /api/config (Cloudflare app ID)
+//       └─ Viewer (browser) → Cloudflare (consumer)
 //
 // LIFECYCLE:
 // 1. MultiStreamManager starts cameras with 12s stagger
