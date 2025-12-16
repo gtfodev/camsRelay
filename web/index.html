@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nest Camera Viewer - Cloudflare Calls</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Nest Camera Viewer</h1>
+            <div class="status-bar">
+                <span id="status">Loading...</span>
+                <span id="camera-count">Cameras: 0</span>
+            </div>
+        </header>
+
+        <main>
+            <div id="camera-grid" class="camera-grid">
+                <!-- Camera tiles will be inserted here -->
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/js/viewer.js" type="module"></script>
+    <script src="/static/js/grid.js" type="module"></script>
+    <script type="module">
+        import { Viewer } from '/static/js/viewer.js';
+        import { Grid } from '/static/js/grid.js';
+
+        // Initialize viewer
+        const grid = new Grid(document.getElementById('camera-grid'));
+        const viewer = new Viewer(grid);
+
+        // Start viewer
+        viewer.start().catch(err => {
+            console.error('Failed to start viewer:', err);
+            document.getElementById('status').textContent = 'Error: ' + err.message;
+            document.getElementById('status').className = 'error';
+        });
+    </script>
+</body>
+</html>
