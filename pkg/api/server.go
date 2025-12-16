@@ -71,18 +71,32 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	s.httpServer = &http.Server{
 		Addr:    addr,
 		Handler: s.withCORS(s.withLogging(mux)),
+		// Add timeouts to prevent resource exhaustion
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	s.logger.Info("starting HTTP server", "address", addr)
 
 	// Start server in goroutine
+	errChan := make(chan error, 1)
 	go func() {
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			s.logger.Error("HTTP server error", "error", err)
+			errChan <- err
 		}
 	}()
 
-	return nil
+	// Give the server a moment to start and check for immediate errors
+	select {
+	case err := <-errChan:
+		return err
+	case <-time.After(100 * time.Millisecond):
+		// Server started successfully
+		return nil
+	}
 }
 
 // Stop gracefully stops the HTTP server
@@ -102,35 +116,40 @@ func (s *Server) handleGetCameras(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stats := s.relay.GetRelayStats()
+	// Handle case where relay is not initialized yet
+	cameras := make([]CameraInfo, 0)
 
-	s.mu.RLock()
-	cameras := make([]CameraInfo, 0, len(stats)*2) // *2 for video and audio tracks
-	for _, stat := range stats {
-		name := s.cameraNames[stat.CameraID]
-		if name == "" {
-			name = stat.CameraID
+	if s.relay != nil {
+		stats := s.relay.GetRelayStats()
+
+		s.mu.RLock()
+		cameras = make([]CameraInfo, 0, len(stats)*2) // *2 for video and audio tracks
+		for _, stat := range stats {
+			name := s.cameraNames[stat.CameraID]
+			if name == "" {
+				name = stat.CameraID
+			}
+
+			// Video track
+			cameras = append(cameras, CameraInfo{
+				CameraID:  stat.CameraID,
+				SessionID: stat.SessionID,
+				TrackName: "video",
+				Name:      name,
+				Kind:      "video",
+			})
+
+			// Audio track
+			cameras = append(cameras, CameraInfo{
+				CameraID:  stat.CameraID,
+				SessionID: stat.SessionID,
+				TrackName: "audio",
+				Name:      name,
+				Kind:      "audio",
+			})
 		}
-
-		// Video track
-		cameras = append(cameras, CameraInfo{
-			CameraID:  stat.CameraID,
-			SessionID: stat.SessionID,
-			TrackName: "video",
-			Name:      name,
-			Kind:      "video",
-		})
-
-		// Audio track
-		cameras = append(cameras, CameraInfo{
-			CameraID:  stat.CameraID,
-			SessionID: stat.SessionID,
-			TrackName: "audio",
-			Name:      name,
-			Kind:      "audio",
-		})
+		s.mu.RUnlock()
 	}
-	s.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(cameras)
