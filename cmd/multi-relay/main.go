@@ -111,6 +111,24 @@ func main() {
 		"qpm_limit", msmConfig.QPM,
 		"stagger_interval", msmConfig.StaggerInterval)
 
+	// Create and start HTTP API server for viewer FIRST (before camera init)
+	apiServer := api.NewServer(
+		multiRelay,
+		cfg.Cloudflare.AppID,
+		logger.With("component", "api"),
+	)
+
+	// Set camera display names in the API server
+	for deviceID, name := range cameraNames {
+		apiServer.SetCameraName(deviceID, name)
+	}
+
+	// Start HTTP server before cameras so viewer is available immediately
+	if err := apiServer.Start(ctx, ":8080"); err != nil {
+		log.Fatalf("Failed to start API server: %v", err)
+	}
+	logger.Info("API server started", "address", "http://localhost:8080")
+
 	// Start the multi-relay (starts stream manager internally)
 	if err := multiRelay.Start(ctx); err != nil {
 		log.Fatalf("Failed to start multi-relay: %v", err)
@@ -127,25 +145,6 @@ func main() {
 	}
 
 	logger.Info("all cameras initialization triggered - relays will be created as streams become ready")
-
-	// Create and start HTTP API server for viewer
-	apiServer := api.NewServer(
-		multiRelay,
-		cfg.Cloudflare.AppID,
-		logger.With("component", "api"),
-	)
-
-	// Set camera display names in the API server
-	for deviceID, name := range cameraNames {
-		apiServer.SetCameraName(deviceID, name)
-	}
-
-	// Start HTTP server
-	if err := apiServer.Start(ctx, ":8080"); err != nil {
-		log.Fatalf("Failed to start API server: %v", err)
-	}
-
-	logger.Info("API server started", "address", "http://localhost:8080")
 
 	// Start monitoring goroutine
 	go monitorStatus(multiRelay, streamMgr, logger)
