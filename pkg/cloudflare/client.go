@@ -146,6 +146,13 @@ func (c *Client) Renegotiate(ctx context.Context, sessionID string, req *Renegot
 	}
 	defer resp.Body.Close()
 
+	// Cloudflare returns 204 No Content on successful renegotiation
+	if resp.StatusCode == http.StatusNoContent {
+		c.logger.Info("renegotiated session", "session_id", sessionID)
+		// Return empty response for 204 - renegotiation doesn't return SDP
+		return &RenegotiateResponse{}, nil
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
