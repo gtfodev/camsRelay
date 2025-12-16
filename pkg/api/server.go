@@ -179,29 +179,20 @@ func (s *Server) handleGetCameras(w http.ResponseWriter, r *http.Request) {
 
 		if stats != nil {
 			s.mu.RLock()
-			cameras = make([]CameraInfo, 0, len(stats)*2) // *2 for video and audio tracks
+			cameras = make([]CameraInfo, 0, len(stats)) // Only video tracks
 			for _, stat := range stats {
 				name := s.cameraNames[stat.CameraID]
 				if name == "" {
 					name = stat.CameraID
 				}
 
-				// Video track
+				// Video track only (audio not currently populated)
 				cameras = append(cameras, CameraInfo{
 					CameraID:  stat.CameraID,
 					SessionID: stat.SessionID,
 					TrackName: "video",
 					Name:      name,
 					Kind:      "video",
-				})
-
-				// Audio track
-				cameras = append(cameras, CameraInfo{
-					CameraID:  stat.CameraID,
-					SessionID: stat.SessionID,
-					TrackName: "audio",
-					Name:      name,
-					Kind:      "audio",
 				})
 			}
 			s.mu.RUnlock()
