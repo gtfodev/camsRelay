@@ -40,3 +40,10 @@ build/
 # Test coverage
 *.out
 coverage.html
+
+# Log files
+*.log
+*.output
+
+# Binaries directory
+/bin/
