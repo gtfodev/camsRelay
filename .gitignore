@@ -1,0 +1,42 @@
+# Binaries
+relay
+cmd/relay/relay
+cmd/verify/verify
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation artifacts
+*.Zone.Identifier
+
+# Embedded repositories (reference only)
+go2rtc/
+
+# Build artifacts
+dist/
+build/
+
+# Test coverage
+*.out
+coverage.html
