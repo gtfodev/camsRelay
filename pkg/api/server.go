@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -10,6 +12,9 @@ import (
 
 	"github.com/ethan/nest-cloudflare-relay/pkg/relay"
 )
+
+//go:embed web/*
+var webFS embed.FS
 
 // Server provides HTTP API for camera session discovery and web viewer
 type Server struct {
@@ -64,9 +69,15 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	mux.HandleFunc("/api/cameras", s.handleGetCameras)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 
-	// Static file server for viewer
+	// Static file server for viewer using embedded filesystem
+	staticFS, err := fs.Sub(webFS, "web/static")
+	if err != nil {
+		return err
+	}
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+
+	// Index page handler
 	mux.HandleFunc("/", s.handleIndex)
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 
 	s.httpServer = &http.Server{
 		Addr:    addr,
@@ -170,14 +181,23 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleIndex serves the main viewer page
+// handleIndex serves the main viewer page from embedded filesystem
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 
-	http.ServeFile(w, r, "web/index.html")
+	// Read index.html from embedded filesystem
+	indexHTML, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		s.logger.Error("failed to read index.html", "error", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(indexHTML)
 }
 
 // withCORS adds CORS headers to responses

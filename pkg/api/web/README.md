@@ -43,6 +43,8 @@ Provides HTTP endpoints for the viewer:
 - `GET /` - Serves main viewer HTML page
 - `GET /static/*` - Serves static assets (JS, CSS)
 
+**Implementation:** Static files are embedded into the binary using `go:embed`. This ensures the web assets are always available regardless of where the binary is run from.
+
 ### Frontend Viewer (JavaScript)
 
 **Files:**
