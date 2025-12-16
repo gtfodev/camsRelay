@@ -183,15 +183,27 @@ class CameraConnection {
                 console.log(`[Camera ${this.cameraData.id}] ICE state:`, this.pc.iceConnectionState);
             };
 
+            // Handle ICE candidates
+            this.pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log(`[Camera ${this.cameraData.id}] ICE candidate:`, event.candidate.candidate);
+                } else {
+                    console.log(`[Camera ${this.cameraData.id}] ICE gathering complete`);
+                }
+            };
+
             // Set remote description (offer from Cloudflare)
+            console.log(`[Camera ${this.cameraData.id}] Setting remote description, SDP length:`, offer.length);
             await this.pc.setRemoteDescription({
                 type: 'offer',
                 sdp: offer
             });
 
             // Create answer
+            console.log(`[Camera ${this.cameraData.id}] Creating answer`);
             const answer = await this.pc.createAnswer();
             await this.pc.setLocalDescription(answer);
+            console.log(`[Camera ${this.cameraData.id}] Set local description, answer SDP length:`, answer.sdp.length);
 
             // Send answer to Cloudflare
             await this.renegotiate(answer.sdp);
@@ -239,6 +251,8 @@ class CameraConnection {
             trackName: track.trackName
         }));
 
+        console.log(`[Camera ${this.cameraData.id}] Pulling tracks:`, { url, tracks });
+
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -253,20 +267,26 @@ class CameraConnection {
         }
 
         const data = await response.json();
+        console.log(`[Camera ${this.cameraData.id}] Received tracks response:`, data);
+
         if (data.errorCode) {
             throw new Error(`Cloudflare error: ${data.errorCode} - ${data.errorDescription}`);
         }
 
         if (!data.sessionDescription || !data.sessionDescription.sdp) {
+            console.error(`[Camera ${this.cameraData.id}] Invalid response structure:`, data);
             throw new Error('No SDP offer received from Cloudflare');
         }
 
+        console.log(`[Camera ${this.cameraData.id}] Extracted SDP offer, length:`, data.sessionDescription.sdp.length);
         return data.sessionDescription.sdp;
     }
 
     async renegotiate(answerSdp) {
         // Call backend proxy instead of Cloudflare directly
         const url = `/api/cf/sessions/${this.sessionId}/renegotiate`;
+
+        console.log(`[Camera ${this.cameraData.id}] Sending renegotiate request, answer SDP length:`, answerSdp.length);
 
         const response = await fetch(url, {
             method: 'PUT',
@@ -287,9 +307,13 @@ class CameraConnection {
         }
 
         const data = await response.json();
+        console.log(`[Camera ${this.cameraData.id}] Renegotiate response:`, data);
+
         if (data.errorCode) {
             throw new Error(`Cloudflare error: ${data.errorCode} - ${data.errorDescription}`);
         }
+
+        console.log(`[Camera ${this.cameraData.id}] Renegotiation complete`);
     }
 
     handleDisconnect() {
