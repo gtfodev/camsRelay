@@ -323,8 +323,17 @@ func (s *Server) handleSessionOperation(w http.ResponseWriter, r *http.Request) 
 
 	switch operation {
 	case "tracks":
-		if len(parts) >= 3 && parts[2] == "new" {
-			s.handleAddTracks(w, r, sessionID)
+		if len(parts) >= 3 {
+			switch parts[2] {
+			case "new":
+				s.handleAddTracks(w, r, sessionID)
+			case "update":
+				s.handleUpdateTracks(w, r, sessionID)
+			case "close":
+				s.handleCloseTracks(w, r, sessionID)
+			default:
+				http.Error(w, "invalid tracks operation", http.StatusBadRequest)
+			}
 		} else {
 			http.Error(w, "invalid tracks operation", http.StatusBadRequest)
 		}
@@ -405,6 +414,89 @@ func (s *Server) handleDebugSession(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stateResp)
+}
+
+// handleUpdateTracks proxies track update requests to Cloudflare
+func (s *Server) handleUpdateTracks(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Parse request body
+	var req cloudflare.UpdateTracksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.logger.Error("failed to parse update tracks request", "error", err)
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Info("viewer updating tracks",
+		"viewer_session_id", sessionID,
+		"tracks", req.Tracks)
+
+	// Update tracks via Cloudflare client (authenticated)
+	resp, err := s.cfClient.UpdateTracks(ctx, sessionID, &req)
+	if err != nil {
+		s.logger.Error("failed to update tracks",
+			"session_id", sessionID,
+			"error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.logger.Info("Cloudflare UpdateTracks response",
+		"viewer_session_id", sessionID,
+		"requires_renegotiation", resp.RequiresImmediateRenegotiation,
+		"tracks", resp.Tracks)
+
+	// Return response to frontend
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleCloseTracks proxies track close requests to Cloudflare
+func (s *Server) handleCloseTracks(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Parse request body
+	var req cloudflare.CloseTracksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.logger.Error("failed to parse close tracks request", "error", err)
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Info("viewer closing tracks",
+		"viewer_session_id", sessionID,
+		"tracks", req.Tracks,
+		"force", req.Force)
+
+	// Close tracks via Cloudflare client (authenticated)
+	resp, err := s.cfClient.CloseTracks(ctx, sessionID, &req)
+	if err != nil {
+		s.logger.Error("failed to close tracks",
+			"session_id", sessionID,
+			"error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.logger.Info("Cloudflare CloseTracks response",
+		"viewer_session_id", sessionID,
+		"requires_renegotiation", resp.RequiresImmediateRenegotiation,
+		"tracks", resp.Tracks)
+
+	// Return response to frontend
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleRenegotiate proxies renegotiation requests to Cloudflare
