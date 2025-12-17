@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -13,6 +13,7 @@ import (
 	"github.com/ethan/nest-cloudflare-relay/pkg/bridge"
 	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
 	"github.com/ethan/nest-cloudflare-relay/pkg/config"
+	"github.com/ethan/nest-cloudflare-relay/pkg/logger"
 	"github.com/ethan/nest-cloudflare-relay/pkg/nest"
 	"github.com/ethan/nest-cloudflare-relay/pkg/rtp"
 	rtspClient "github.com/ethan/nest-cloudflare-relay/pkg/rtsp"
@@ -20,21 +21,49 @@ import (
 )
 
 func main() {
-	// Initialize structured logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
+	// Parse command-line flags
+	fs := flag.NewFlagSet("relay", flag.ExitOnError)
+	logFlags := logger.RegisterFlags(fs)
 
-	logger.Info("starting Nest Camera → Cloudflare SFU relay - Phase 2")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Nest Camera → Cloudflare SFU relay\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fs.PrintDefaults()
+		logger.PrintUsageExamples()
+	}
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize logger from flags
+	logConfig, err := logFlags.ToConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error configuring logger: %v\n", err)
+		os.Exit(1)
+	}
+
+	log, err := logger.New(logConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer log.Close()
+
+	logger.SetDefault(log)
+
+	log.Info("starting Nest Camera → Cloudflare SFU relay - Phase 2",
+		"log_config", logFlags.String())
 
 	// Load configuration
 	cfg, err := config.Load(".env")
 	if err != nil {
-		logger.Error("failed to load configuration", "error", err)
+		log.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("configuration loaded")
+	log.Info("configuration loaded")
 
 	// Create context with cancellation for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -46,7 +75,7 @@ func main() {
 
 	go func() {
 		sig := <-sigChan
-		logger.Info("received shutdown signal", "signal", sig)
+		log.Info("received shutdown signal", "signal", sig)
 		cancel()
 	}()
 
@@ -55,18 +84,18 @@ func main() {
 		cfg.Google.ClientID,
 		cfg.Google.ClientSecret,
 		cfg.Google.RefreshToken,
-		logger.With("component", "nest"),
+		log.With("component", "nest").Logger,
 	)
-	logger.Info("Nest client initialized")
+	log.Info("Nest client initialized")
 
 	// List available cameras
 	devices, err := nestClient.ListDevices(ctx, cfg.Google.ProjectID)
 	if err != nil {
-		logger.Error("failed to list devices", "error", err)
+		log.Error("failed to list devices", "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("cameras discovered", "count", len(devices))
+	log.Info("cameras discovered", "count", len(devices))
 	for i, device := range devices {
 		displayName := device.Traits.Info.CustomName
 		if displayName == "" && len(device.Relations) > 0 {
@@ -76,7 +105,7 @@ func main() {
 			displayName = device.DeviceID
 		}
 
-		logger.Info("camera",
+		log.Info("camera",
 			"index", i+1,
 			"name", displayName,
 			"device_id", device.DeviceID,
@@ -87,7 +116,7 @@ func main() {
 	}
 
 	if len(devices) == 0 {
-		logger.Warn("no cameras found")
+		log.Warn("no cameras found")
 		os.Exit(0)
 	}
 
@@ -95,9 +124,9 @@ func main() {
 	cfClient := cloudflare.NewClient(
 		cfg.Cloudflare.AppID,
 		cfg.Cloudflare.APIToken,
-		logger.With("component", "cloudflare"),
+		log.With("component", "cloudflare").Logger,
 	)
-	logger.Info("Cloudflare client initialized")
+	log.Info("Cloudflare client initialized")
 
 	// Select first camera for proof of concept
 	firstCamera := devices[0]
@@ -109,18 +138,18 @@ func main() {
 		displayName = firstCamera.DeviceID
 	}
 
-	logger.Info("starting stream for camera",
+	log.Info("starting stream for camera",
 		"name", displayName,
 		"device_id", firstCamera.DeviceID)
 
 	// Generate RTSP stream
 	stream, err := nestClient.GenerateRTSPStream(ctx, cfg.Google.ProjectID, firstCamera.DeviceID)
 	if err != nil {
-		logger.Error("failed to generate RTSP stream", "error", err)
+		log.Error("failed to generate RTSP stream", "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("RTSP stream generated",
+	log.Info("RTSP stream generated",
 		"url", stream.URL,
 		"expires_at", stream.ExpiresAt.Format(time.RFC3339),
 		"ttl_seconds", int(time.Until(stream.ExpiresAt).Seconds()))
@@ -129,47 +158,47 @@ func main() {
 	streamMgr := nest.NewStreamManager(
 		nestClient,
 		stream,
-		logger.With("component", "stream-manager"),
+		log.With("component", "stream-manager").Logger,
 	)
 	streamMgr.Start()
 	defer func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stopCancel()
 		if err := streamMgr.Stop(stopCtx); err != nil {
-			logger.Error("failed to stop stream manager", "error", err)
+			log.Error("failed to stop stream manager", "error", err)
 		}
 	}()
 
 	// Create WebRTC bridge to Cloudflare
-	webrtcBridge, err := bridge.NewBridge(ctx, cfClient, logger.With("component", "bridge"))
+	webrtcBridge, err := bridge.NewBridge(ctx, cfClient, log.With("component", "bridge").Logger)
 	if err != nil {
-		logger.Error("failed to create bridge", "error", err)
+		log.Error("failed to create bridge", "error", err)
 		os.Exit(1)
 	}
 	defer webrtcBridge.Close()
 
 	// Create Cloudflare session and setup WebRTC
 	if err := webrtcBridge.CreateSession(ctx); err != nil {
-		logger.Error("failed to create Cloudflare session", "error", err)
+		log.Error("failed to create Cloudflare session", "error", err)
 		os.Exit(1)
 	}
 
 	// Negotiate SDP with Cloudflare
 	if err := webrtcBridge.Negotiate(ctx); err != nil {
-		logger.Error("failed to negotiate with Cloudflare", "error", err)
+		log.Error("failed to negotiate with Cloudflare", "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("WebRTC bridge established",
+	log.Info("WebRTC bridge established",
 		"session_id", webrtcBridge.GetSessionID(),
 		"state", webrtcBridge.GetConnectionState().String())
 
 	// Create RTSP client
-	rtspConn := rtspClient.NewClient(stream.URL, logger.With("component", "rtsp"))
+	rtspConn := rtspClient.NewClient(stream.URL, log.With("component", "rtsp").Logger)
 
 	// Connect to RTSP server
 	if err := rtspConn.Connect(ctx); err != nil {
-		logger.Error("failed to connect to RTSP server", "error", err)
+		log.Error("failed to connect to RTSP server", "error", err)
 		os.Exit(1)
 	}
 	defer rtspConn.Close()
@@ -189,11 +218,11 @@ func main() {
 		// Write to WebRTC bridge
 		// Note: For production, we'd use proper timing, but for POC we use fixed duration
 		if err := webrtcBridge.WriteVideoSample(nalus, 33*time.Millisecond); err != nil {
-			logger.Warn("failed to write video sample", "error", err)
+			log.Warn("failed to write video sample", "error", err)
 		}
 
 		if videoFrameCount.Load()%30 == 0 { // Log every 30 frames (~1 second)
-			logger.Debug("video frame written",
+			log.Debug("video frame written",
 				"frame_count", videoFrameCount.Load(),
 				"keyframe", keyframe,
 				"size_bytes", len(nalus))
@@ -207,7 +236,7 @@ func main() {
 		// Note: For production, AAC would need transcoding to Opus
 		// For now, we log but don't forward (Cloudflare expects Opus)
 		if audioFrameCount.Load()%100 == 0 { // Log every 100 frames
-			logger.Debug("audio frame received",
+			log.Debug("audio frame received",
 				"frame_count", audioFrameCount.Load(),
 				"size_bytes", len(frame))
 		}
@@ -216,7 +245,7 @@ func main() {
 		// For Phase 2 POC, we're focusing on video only
 	}
 
-	// Setup RTP packet handler
+	// Setup RTP packet handler with debug logging
 	rtspConn.OnRTPPacket = func(channel byte, packet *pionRTP.Packet) {
 		ch, ok := rtspConn.Channels[channel]
 		if !ok {
@@ -225,30 +254,34 @@ func main() {
 
 		if ch.MediaType == "video" {
 			videoPacketCount.Add(1)
+
+			// Debug log RTP packet details if enabled
+			log.DebugRTPPacket(packet.SequenceNumber, packet.Timestamp, packet.PayloadType, len(packet.Payload))
+
 			if err := h264Proc.ProcessPacket(packet); err != nil {
-				logger.Warn("failed to process H.264 packet", "error", err)
+				log.Warn("failed to process H.264 packet", "error", err)
 			}
 		} else if ch.MediaType == "audio" {
 			audioPacketCount.Add(1)
 			if err := aacProc.ProcessPacket(packet); err != nil {
-				logger.Warn("failed to process AAC packet", "error", err)
+				log.Warn("failed to process AAC packet", "error", err)
 			}
 		}
 	}
 
 	// Setup all tracks
 	if err := rtspConn.SetupTracks(ctx); err != nil {
-		logger.Error("failed to setup tracks", "error", err)
+		log.Error("failed to setup tracks", "error", err)
 		os.Exit(1)
 	}
 
 	// Start playing
 	if err := rtspConn.Play(ctx); err != nil {
-		logger.Error("failed to start RTSP playback", "error", err)
+		log.Error("failed to start RTSP playback", "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("RTSP playback started - streaming to Cloudflare")
+	log.Info("RTSP playback started - streaming to Cloudflare")
 
 	// Start stats logger
 	statsTicker := time.NewTicker(10 * time.Second)
@@ -260,7 +293,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-statsTicker.C:
-				logger.Info("streaming statistics",
+				log.Info("streaming statistics",
 					"video_packets", videoPacketCount.Load(),
 					"video_frames", videoFrameCount.Load(),
 					"audio_packets", audioPacketCount.Load(),
@@ -272,7 +305,7 @@ func main() {
 	}()
 
 	// Read packets until context cancelled
-	logger.Info("ready - press Ctrl+C to stop")
+	log.Info("ready - press Ctrl+C to stop")
 	fmt.Println("\n✓ Phase 2 Complete - Full Pipeline Active:")
 	fmt.Printf("  - Camera: %s\n", displayName)
 	fmt.Printf("  - RTSP: %s\n", stream.URL)
@@ -281,9 +314,9 @@ func main() {
 	fmt.Printf("  - Pipeline: RTSP → RTP → H.264 → WebRTC → Cloudflare\n\n")
 
 	if err := rtspConn.ReadPackets(ctx); err != nil && ctx.Err() == nil {
-		logger.Error("error reading packets", "error", err)
+		log.Error("error reading packets", "error", err)
 		os.Exit(1)
 	}
 
-	logger.Info("graceful shutdown complete")
+	log.Info("graceful shutdown complete")
 }
