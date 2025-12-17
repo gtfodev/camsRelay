@@ -181,6 +181,14 @@ class CameraTile {
         });
     }
 
+    setName(name) {
+        this.name = name;
+        const nameElement = this.element.querySelector('.camera-name');
+        if (nameElement) {
+            nameElement.textContent = this.escapeHtml(name);
+        }
+    }
+
     setStatus(status) {
         this.statusElement.textContent = status;
         this.statusElement.className = `camera-status ${status}`;
