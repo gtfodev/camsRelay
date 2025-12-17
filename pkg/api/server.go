@@ -74,6 +74,7 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	// API endpoints
 	mux.HandleFunc("/api/cameras", s.handleGetCameras)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
+	mux.HandleFunc("/api/debug/session", s.handleDebugSession)
 
 	// Cloudflare proxy endpoints (authenticated on backend)
 	mux.HandleFunc("/api/cf/sessions/new", s.handleCreateSession)
@@ -351,6 +352,11 @@ func (s *Server) handleAddTracks(w http.ResponseWriter, r *http.Request, session
 		return
 	}
 
+	// Log the request for debugging
+	s.logger.Info("viewer pulling tracks",
+		"viewer_session_id", sessionID,
+		"tracks", req.Tracks)
+
 	// Add tracks via Cloudflare client (authenticated)
 	resp, err := s.cfClient.AddTracks(ctx, sessionID, &req)
 	if err != nil {
@@ -361,9 +367,44 @@ func (s *Server) handleAddTracks(w http.ResponseWriter, r *http.Request, session
 		return
 	}
 
+	// Log the response for debugging
+	s.logger.Info("Cloudflare AddTracks response",
+		"viewer_session_id", sessionID,
+		"requires_renegotiation", resp.RequiresImmediateRenegotiation,
+		"tracks", resp.Tracks)
+
 	// Return response to frontend
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleDebugSession provides debug information about camera sessions
+func (s *Server) handleDebugSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionIDParam := r.URL.Query().Get("sessionId")
+	if sessionIDParam == "" {
+		http.Error(w, "sessionId parameter required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Get session state from Cloudflare
+	stateResp, err := s.cfClient.GetSessionState(ctx, sessionIDParam)
+	if err != nil {
+		s.logger.Error("failed to get session state",
+			"session_id", sessionIDParam,
+			"error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stateResp)
 }
 
 // handleRenegotiate proxies renegotiation requests to Cloudflare
