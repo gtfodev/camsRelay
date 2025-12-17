@@ -81,3 +81,18 @@ type GetSessionStateResponse struct {
 	ErrorCode string        `json:"errorCode,omitempty"`
 	ErrorDesc string        `json:"errorDescription,omitempty"`
 }
+
+// UpdateTracksRequest is used to update existing tracks by reusing transceivers
+type UpdateTracksRequest struct {
+	Tracks             []TrackObject       `json:"tracks"`
+	SessionDescription *SessionDescription `json:"sessionDescription,omitempty"`
+}
+
+// UpdateTracksResponse is returned when updating tracks
+type UpdateTracksResponse struct {
+	RequiresImmediateRenegotiation bool                `json:"requiresImmediateRenegotiation"`
+	SessionDescription             *SessionDescription `json:"sessionDescription,omitempty"`
+	Tracks                         []TrackObject       `json:"tracks,omitempty"`
+	ErrorCode                      string              `json:"errorCode,omitempty"`
+	ErrorDesc                      string              `json:"errorDescription,omitempty"`
+}

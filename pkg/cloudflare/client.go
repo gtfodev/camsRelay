@@ -266,6 +266,55 @@ func (c *Client) GetSessionState(ctx context.Context, sessionID string) (*GetSes
 	return &stateResp, nil
 }
 
+// UpdateTracks updates existing tracks by reusing transceivers
+func (c *Client) UpdateTracks(ctx context.Context, sessionID string, req *UpdateTracksRequest) (*UpdateTracksResponse, error) {
+	url := fmt.Sprintf("%s/apps/%s/sessions/%s/tracks/update", baseURL, c.appID, sessionID)
+
+	bodyBytes, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal update tracks request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiToken)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("update tracks request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("update tracks failed: %s (status %d)", body, resp.StatusCode)
+	}
+
+	var updateResp UpdateTracksResponse
+	if err := json.Unmarshal(body, &updateResp); err != nil {
+		return nil, fmt.Errorf("decode update tracks response: %w", err)
+	}
+
+	if updateResp.ErrorCode != "" {
+		return nil, fmt.Errorf("update tracks error: %s - %s",
+			updateResp.ErrorCode, updateResp.ErrorDesc)
+	}
+
+	c.logger.Info("updated tracks",
+		"session_id", sessionID,
+		"track_count", len(updateResp.Tracks),
+		"requires_renegotiation", updateResp.RequiresImmediateRenegotiation)
+
+	return &updateResp, nil
+}
+
 // AddTracksWithRetry adds tracks with automatic retry on transient failures
 func (c *Client) AddTracksWithRetry(ctx context.Context, sessionID string, req *TracksRequest, maxRetries int) (*TracksResponse, error) {
 	var lastErr error
