@@ -201,6 +201,32 @@ class CameraTile {
         this.errorElement.style.display = 'none';
     }
 
+    updateStats(stats) {
+        // Update stats display if stats element exists
+        if (!this.statsElement) {
+            // Create stats element if it doesn't exist
+            this.statsElement = document.createElement('div');
+            this.statsElement.className = 'stats-overlay';
+            this.statsElement.style.cssText = 'position:absolute;bottom:5px;left:5px;font-size:10px;color:#0f0;background:rgba(0,0,0,0.5);padding:2px 5px;border-radius:3px;font-family:monospace;';
+            this.element.style.position = 'relative';
+            this.element.appendChild(this.statsElement);
+        }
+
+        const { framesDecoded, framesReceived, packetsReceived, packetsLost } = stats;
+        const lossRate = packetsReceived > 0 ? ((packetsLost / packetsReceived) * 100).toFixed(1) : 0;
+
+        this.statsElement.innerHTML = `📦 ${packetsReceived} | 🎞️ ${framesDecoded}/${framesReceived} | 📉 ${lossRate}%`;
+
+        // Color code based on health
+        if (framesDecoded === 0 && packetsReceived > 0) {
+            this.statsElement.style.color = '#f00'; // Red - decoder issue
+        } else if (lossRate > 5) {
+            this.statsElement.style.color = '#ff0'; // Yellow - packet loss
+        } else {
+            this.statsElement.style.color = '#0f0'; // Green - healthy
+        }
+    }
+
     destroy() {
         // Stop video stream
         if (this.videoElement.srcObject) {
