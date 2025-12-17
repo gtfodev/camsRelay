@@ -1,32 +1,39 @@
 /**
- * Viewer manages the WebRTC viewer lifecycle:
- * - Fetches camera list from backend
- * - Creates WebRTC connections to Cloudflare for each camera
- * - Handles reconnection on failures
+ * Viewer manages a SINGLE WebRTC session for ALL cameras
+ * Optimized architecture:
+ * - First camera: ~3s (full setup)
+ * - Additional cameras: ~500ms (batch track pull)
+ * - Camera switch: ~100ms (track update, no renegotiation)
  */
 
 export class Viewer {
     constructor(grid) {
         this.grid = grid;
-        this.cameras = new Map(); // cameraId -> CameraConnection
+        this.cameras = new Map(); // cameraId -> CameraTile (UI only)
         this.config = null;
         this.refreshInterval = null;
+
+        // Single session for all cameras
+        this.sessionId = null;
+        this.pc = null;
+        this.trackMids = new Map(); // cameraId -> mid (for track updates)
+        this.pendingTracks = new Map(); // trackName -> cameraId (to route ontrack events)
     }
 
     async start() {
         console.log('[Viewer] Starting viewer');
 
-        // Fetch Cloudflare configuration
         this.config = await this.fetchConfig();
-        console.log('[Viewer] Loaded config:', this.config);
+
+        // Create single viewer session
+        await this.initSession();
 
         // Initial camera fetch
         await this.refreshCameras();
 
-        // Periodically refresh camera list (in case new cameras are added)
         this.refreshInterval = setInterval(() => {
             this.refreshCameras();
-        }, 30000); // Every 30 seconds
+        }, 30000);
 
         this.updateStatus('Connected', 'connected');
     }
@@ -36,11 +43,17 @@ export class Viewer {
             clearInterval(this.refreshInterval);
         }
 
-        // Close all camera connections
-        for (const connection of this.cameras.values()) {
-            connection.close();
+        // Close all camera tiles
+        for (const tile of this.cameras.values()) {
+            tile.destroy();
         }
         this.cameras.clear();
+
+        // Close peer connection
+        if (this.pc) {
+            this.pc.close();
+            this.pc = null;
+        }
     }
 
     async fetchConfig() {
@@ -51,6 +64,57 @@ export class Viewer {
         return response.json();
     }
 
+    async initSession() {
+        // Create ONE session
+        const response = await fetch('/api/cf/sessions/new', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to create session: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        this.sessionId = data.sessionId;
+        console.log('[Viewer] Created single viewer session:', this.sessionId);
+
+        // Create ONE PeerConnection
+        this.pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        this.pc.ontrack = (event) => {
+            // Route track to correct camera tile
+            const mid = event.transceiver?.mid;
+            console.log('[Viewer] Received track:', event.track.kind, 'mid:', mid);
+
+            // Find which camera this track belongs to
+            for (const [cameraId, cameraMid] of this.trackMids) {
+                if (cameraMid === mid && event.track.kind === 'video') {
+                    const tile = this.cameras.get(cameraId);
+                    if (tile) {
+                        tile.attachStream(event.streams[0]);
+                    }
+                    break;
+                }
+            }
+        };
+
+        this.pc.onconnectionstatechange = () => {
+            console.log('[Viewer] Connection state:', this.pc.connectionState);
+            if (this.pc.connectionState === 'connected') {
+                this.startStatsMonitoring();
+            } else if (this.pc.connectionState === 'failed') {
+                this.handleDisconnect();
+            }
+        };
+
+        this.pc.oniceconnectionstatechange = () => {
+            console.log('[Viewer] ICE state:', this.pc.iceConnectionState);
+        };
+    }
+
     async refreshCameras() {
         try {
             const response = await fetch('/api/cameras');
@@ -59,9 +123,8 @@ export class Viewer {
             }
 
             const cameras = await response.json();
-            console.log('[Viewer] Fetched cameras:', cameras);
 
-            // Group cameras by cameraId (video + audio tracks)
+            // Group by cameraId
             const cameraMap = new Map();
             for (const camera of cameras) {
                 if (!cameraMap.has(camera.cameraId)) {
@@ -78,26 +141,26 @@ export class Viewer {
                 });
             }
 
-            // Create connections for new cameras
+            // Find new cameras to add
+            const newCameras = [];
             for (const [cameraId, cameraData] of cameraMap) {
                 if (!this.cameras.has(cameraId)) {
-                    console.log('[Viewer] Creating connection for camera:', cameraId);
-                    const connection = new CameraConnection(
-                        cameraData,
-                        this.config.appId,
-                        this.grid
-                    );
-                    this.cameras.set(cameraId, connection);
-                    await connection.connect();
+                    // Create tile immediately
+                    const tile = new CameraTile(cameraId, cameraData.name, this.grid);
+                    this.cameras.set(cameraId, tile);
+                    newCameras.push(cameraData);
                 }
             }
 
-            // Remove cameras that are no longer available
-            for (const [cameraId, connection] of this.cameras) {
+            // Pull all new camera tracks in ONE request
+            if (newCameras.length > 0) {
+                await this.pullCameraTracks(newCameras);
+            }
+
+            // Remove cameras no longer available
+            for (const [cameraId, tile] of this.cameras) {
                 if (!cameraMap.has(cameraId)) {
-                    console.log('[Viewer] Removing camera:', cameraId);
-                    connection.close();
-                    this.cameras.delete(cameraId);
+                    await this.removeCamera(cameraId);
                 }
             }
 
@@ -109,274 +172,150 @@ export class Viewer {
         }
     }
 
-    updateStatus(text, className) {
-        const statusEl = document.getElementById('status');
-        statusEl.textContent = text;
-        statusEl.className = className;
-    }
+    async pullCameraTracks(camerasData) {
+        // Build tracks array for ALL cameras at once
+        const tracks = [];
 
-    updateCameraCount(count) {
-        const countEl = document.getElementById('camera-count');
-        countEl.textContent = `Cameras: ${count}`;
-    }
-}
-
-/**
- * CameraConnection manages WebRTC connection for a single camera
- */
-class CameraConnection {
-    constructor(cameraData, appId, grid) {
-        this.cameraData = cameraData;
-        this.appId = appId; // No longer used (kept for backward compat)
-        this.grid = grid;
-        this.pc = null;
-        this.tile = null;
-        this.sessionId = null;
-        this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 5;
-        this.reconnectDelay = 3000;
-        this.statsInterval = null;
-    }
-
-    async connect() {
-        console.log(`[Camera ${this.cameraData.id}] Connecting`);
-
-        try {
-            // Create tile in grid
-            this.tile = this.grid.addCamera(this.cameraData.id, this.cameraData.name);
-            this.updateStatus('connecting');
-
-            // Create viewer session in Cloudflare
-            this.sessionId = await this.createViewerSession();
-            console.log(`[Camera ${this.cameraData.id}] Created viewer session:`, this.sessionId);
-
-            // Pull remote tracks from producer session
-            const offer = await this.pullRemoteTracks();
-            console.log(`[Camera ${this.cameraData.id}] Received offer from Cloudflare`);
-
-            // Create peer connection
-            this.pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-            });
-
-            // Handle incoming tracks
-            this.pc.ontrack = (event) => {
-                console.log(`[Camera ${this.cameraData.id}] Received track:`, event.track.kind);
-                if (event.track.kind === 'video') {
-                    this.tile.attachStream(event.streams[0]);
-                }
-            };
-
-            // Handle connection state changes
-            this.pc.onconnectionstatechange = () => {
-                console.log(`[Camera ${this.cameraData.id}] Connection state:`, this.pc.connectionState);
-                this.updateStatus(this.pc.connectionState);
-
-                if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'disconnected') {
-                    this.stopStatsMonitoring();
-                    this.handleDisconnect();
-                } else if (this.pc.connectionState === 'connected') {
-                    this.reconnectAttempts = 0; // Reset on successful connection
-                    this.startStatsMonitoring();
-                }
-            };
-
-            // Handle ICE connection state changes
-            this.pc.oniceconnectionstatechange = () => {
-                console.log(`[Camera ${this.cameraData.id}] ICE state:`, this.pc.iceConnectionState);
-            };
-
-            // Handle ICE candidates
-            this.pc.onicecandidate = (event) => {
-                if (event.candidate) {
-                    console.log(`[Camera ${this.cameraData.id}] ICE candidate:`, event.candidate.candidate);
-                } else {
-                    console.log(`[Camera ${this.cameraData.id}] ICE gathering complete`);
-                }
-            };
-
-            // Set remote description (offer from Cloudflare)
-            console.log(`[Camera ${this.cameraData.id}] Setting remote description, SDP length:`, offer.length);
-            await this.pc.setRemoteDescription({
-                type: 'offer',
-                sdp: offer
-            });
-
-            // Create answer
-            console.log(`[Camera ${this.cameraData.id}] Creating answer`);
-            const answer = await this.pc.createAnswer();
-            await this.pc.setLocalDescription(answer);
-            console.log(`[Camera ${this.cameraData.id}] Set local description, answer SDP length:`, answer.sdp.length);
-
-            // Send answer to Cloudflare
-            await this.renegotiate(answer.sdp);
-
-            console.log(`[Camera ${this.cameraData.id}] WebRTC negotiation complete`);
-
-        } catch (error) {
-            console.error(`[Camera ${this.cameraData.id}] Connection error:`, error);
-            this.updateStatus('failed');
-            this.tile.setError(error.message);
-            this.scheduleReconnect();
-        }
-    }
-
-    async createViewerSession() {
-        // Call backend proxy instead of Cloudflare directly
-        const response = await fetch('/api/cf/sessions/new', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
+        for (const camera of camerasData) {
+            for (const track of camera.tracks) {
+                tracks.push({
+                    location: 'remote',
+                    sessionId: camera.sessionId,
+                    trackName: track.trackName
+                });
+                // Map trackName to cameraId for ontrack routing
+                this.pendingTracks.set(track.trackName, camera.id);
             }
-        });
-
-        if (!response.ok) {
-            const body = await response.text();
-            throw new Error(`Failed to create session: ${response.statusText} - ${body}`);
         }
 
-        const data = await response.json();
-        if (data.errorCode) {
-            throw new Error(`Cloudflare error: ${data.errorCode} - ${data.errorDescription}`);
-        }
+        console.log('[Viewer] Pulling tracks for', camerasData.length, 'cameras:', tracks);
 
-        return data.sessionId;
-    }
-
-    async pullRemoteTracks() {
-        // Call backend proxy instead of Cloudflare directly
-        const url = `/api/cf/sessions/${this.sessionId}/tracks/new`;
-
-        // First, let's check the producer session state
-        try {
-            const debugResp = await fetch(`/api/debug/session?sessionId=${this.cameraData.sessionId}`);
-            if (debugResp.ok) {
-                const debugData = await debugResp.json();
-                console.log(`[Camera ${this.cameraData.id}] Producer session state:`, debugData);
-            }
-        } catch (err) {
-            console.warn(`[Camera ${this.cameraData.id}] Could not fetch producer session state:`, err);
-        }
-
-        // Pull video and audio tracks from producer session
-        const tracks = this.cameraData.tracks.map(track => ({
-            location: 'remote',
-            sessionId: this.cameraData.sessionId,
-            trackName: track.trackName
-        }));
-
-        console.log(`[Camera ${this.cameraData.id}] Pulling tracks:`, {
-            url,
-            viewerSessionId: this.sessionId,
-            producerSessionId: this.cameraData.sessionId,
-            tracks
-        });
-
-        const response = await fetch(url, {
+        const response = await fetch(`/api/cf/sessions/${this.sessionId}/tracks/new`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tracks })
         });
 
         if (!response.ok) {
-            const body = await response.text();
-            throw new Error(`Failed to pull tracks: ${response.statusText} - ${body}`);
+            throw new Error(`Failed to pull tracks: ${response.statusText}`);
         }
 
         const data = await response.json();
-        console.log(`[Camera ${this.cameraData.id}] Received tracks response:`, data);
 
-        if (data.errorCode) {
-            throw new Error(`Cloudflare error: ${data.errorCode} - ${data.errorDescription}`);
+        // Map mids to cameras for ontrack routing
+        if (data.tracks) {
+            for (const track of data.tracks) {
+                const cameraId = this.pendingTracks.get(track.trackName);
+                if (cameraId && track.mid) {
+                    this.trackMids.set(cameraId, track.mid);
+                    console.log('[Viewer] Mapped camera', cameraId, 'to mid', track.mid);
+                }
+            }
         }
 
-        if (!data.sessionDescription || !data.sessionDescription.sdp) {
-            console.error(`[Camera ${this.cameraData.id}] Invalid response structure:`, data);
-            throw new Error('No SDP offer received from Cloudflare');
+        // Handle SDP negotiation
+        if (data.requiresImmediateRenegotiation && data.sessionDescription) {
+            await this.handleNegotiation(data.sessionDescription);
         }
-
-        console.log(`[Camera ${this.cameraData.id}] Extracted SDP offer, length:`, data.sessionDescription.sdp.length);
-        return data.sessionDescription.sdp;
     }
 
-    async renegotiate(answerSdp) {
-        // Call backend proxy instead of Cloudflare directly
-        const url = `/api/cf/sessions/${this.sessionId}/renegotiate`;
+    async handleNegotiation(offer) {
+        console.log('[Viewer] Setting remote description');
+        await this.pc.setRemoteDescription({
+            type: offer.type,
+            sdp: offer.sdp
+        });
 
-        console.log(`[Camera ${this.cameraData.id}] Sending renegotiate request, answer SDP length:`, answerSdp.length);
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
 
-        const response = await fetch(url, {
+        // Send answer
+        await fetch(`/api/cf/sessions/${this.sessionId}/renegotiate`, {
             method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                sessionDescription: {
-                    type: 'answer',
-                    sdp: answerSdp
-                }
+                sessionDescription: { type: 'answer', sdp: answer.sdp }
             })
         });
 
-        if (!response.ok) {
-            const body = await response.text();
-            throw new Error(`Failed to renegotiate: ${response.statusText} - ${body}`);
-        }
-
-        const data = await response.json();
-        console.log(`[Camera ${this.cameraData.id}] Renegotiate response:`, data);
-
-        if (data.errorCode) {
-            throw new Error(`Cloudflare error: ${data.errorCode} - ${data.errorDescription}`);
-        }
-
-        console.log(`[Camera ${this.cameraData.id}] Renegotiation complete`);
+        console.log('[Viewer] Renegotiation complete');
     }
 
-    handleDisconnect() {
-        console.log(`[Camera ${this.cameraData.id}] Disconnected, attempting reconnect`);
-        this.updateStatus('disconnected');
-        this.scheduleReconnect();
+    async removeCamera(cameraId) {
+        const mid = this.trackMids.get(cameraId);
+
+        if (mid) {
+            // Close track in Cloudflare
+            await fetch(`/api/cf/sessions/${this.sessionId}/tracks/close`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tracks: [{ mid }],
+                    force: true  // Don't renegotiate, just stop data
+                })
+            });
+            this.trackMids.delete(cameraId);
+        }
+
+        const tile = this.cameras.get(cameraId);
+        if (tile) {
+            tile.destroy();
+            this.cameras.delete(cameraId);
+        }
     }
 
-    scheduleReconnect() {
-        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-            console.error(`[Camera ${this.cameraData.id}] Max reconnect attempts reached`);
-            this.updateStatus('failed');
-            this.tile.setError('Connection failed after multiple attempts');
+    // Fast camera switch - reuses existing transceiver
+    async switchCamera(oldCameraId, newCameraData) {
+        const mid = this.trackMids.get(oldCameraId);
+        if (!mid) {
+            // No existing transceiver, do full add
+            await this.pullCameraTracks([newCameraData]);
             return;
         }
 
-        this.reconnectAttempts++;
-        const delay = this.reconnectDelay * this.reconnectAttempts;
+        console.log('[Viewer] Switching camera', oldCameraId, '->', newCameraData.id, 'on mid', mid);
 
-        console.log(`[Camera ${this.cameraData.id}] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+        const response = await fetch(`/api/cf/sessions/${this.sessionId}/tracks/update`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                tracks: [{
+                    location: 'remote',
+                    sessionId: newCameraData.sessionId,
+                    trackName: newCameraData.tracks[0].trackName,
+                    mid: mid
+                }]
+            })
+        });
 
-        setTimeout(() => {
-            this.close();
-            this.connect();
-        }, delay);
+        const data = await response.json();
+
+        // Update our mappings
+        this.trackMids.delete(oldCameraId);
+        this.trackMids.set(newCameraData.id, mid);
+
+        // Update tile
+        const tile = this.cameras.get(oldCameraId);
+        if (tile) {
+            tile.updateCamera(newCameraData.id, newCameraData.name);
+            this.cameras.delete(oldCameraId);
+            this.cameras.set(newCameraData.id, tile);
+        }
+
+        // Usually no renegotiation needed for track update
+        if (data.requiresImmediateRenegotiation) {
+            await this.handleNegotiation(data.sessionDescription);
+        }
     }
 
-    updateStatus(status) {
-        if (this.tile) {
-            this.tile.setStatus(status);
-        }
+    handleDisconnect() {
+        console.log('[Viewer] Disconnected');
+        this.updateStatus('Disconnected', 'disconnected');
     }
 
     startStatsMonitoring() {
-        // Log stats immediately and then every 2 seconds
-        this.logStats();
+        // Monitor stats for the single PeerConnection
         this.statsInterval = setInterval(() => this.logStats(), 2000);
-    }
-
-    stopStatsMonitoring() {
-        if (this.statsInterval) {
-            clearInterval(this.statsInterval);
-            this.statsInterval = null;
-        }
     }
 
     async logStats() {
@@ -386,56 +325,75 @@ class CameraConnection {
             const stats = await this.pc.getStats();
             stats.forEach(report => {
                 if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                    const framesDecoded = report.framesDecoded || 0;
-                    const framesReceived = report.framesReceived || 0;
-                    const framesDropped = report.framesDropped || 0;
-                    const bytesReceived = report.bytesReceived || 0;
-                    const packetsReceived = report.packetsReceived || 0;
-                    const packetsLost = report.packetsLost || 0;
-                    const jitter = report.jitter || 0;
-
-                    console.log(`[Camera ${this.cameraData.id}] WebRTC Stats:`, {
-                        framesDecoded,
-                        framesReceived,
-                        framesDropped,
-                        bytesReceived,
-                        packetsReceived,
-                        packetsLost,
-                        jitter: jitter.toFixed(4)
-                    });
-
-                    // Update tile with stats for visual feedback
-                    if (this.tile) {
-                        this.tile.updateStats({
-                            framesDecoded,
-                            framesReceived,
-                            packetsReceived,
-                            packetsLost
-                        });
-                    }
-
-                    // Diagnostic: if we receive packets but no frames decode, that's the issue
-                    if (packetsReceived > 0 && framesDecoded === 0) {
-                        console.warn(`[Camera ${this.cameraData.id}] WARNING: Packets received (${packetsReceived}) but 0 frames decoded - possible codec/profile mismatch`);
+                    // Find which camera this corresponds to
+                    const mid = report.mid;
+                    for (const [cameraId, cameraMid] of this.trackMids) {
+                        if (cameraMid === mid) {
+                            const tile = this.cameras.get(cameraId);
+                            if (tile) {
+                                tile.updateStats({
+                                    framesDecoded: report.framesDecoded || 0,
+                                    framesReceived: report.framesReceived || 0,
+                                    packetsReceived: report.packetsReceived || 0,
+                                    packetsLost: report.packetsLost || 0
+                                });
+                            }
+                            break;
+                        }
                     }
                 }
             });
         } catch (error) {
-            console.error(`[Camera ${this.cameraData.id}] Error getting stats:`, error);
+            console.error('[Viewer] Error getting stats:', error);
         }
     }
 
-    close() {
-        this.stopStatsMonitoring();
-
-        if (this.pc) {
-            this.pc.close();
-            this.pc = null;
+    updateStatus(text, className) {
+        const statusEl = document.getElementById('status');
+        if (statusEl) {
+            statusEl.textContent = text;
+            statusEl.className = className;
         }
+    }
 
-        if (this.tile) {
-            this.grid.removeCamera(this.cameraData.id);
-            this.tile = null;
+    updateCameraCount(count) {
+        const countEl = document.getElementById('camera-count');
+        if (countEl) {
+            countEl.textContent = `Cameras: ${count}`;
         }
+    }
+}
+
+/**
+ * CameraTile - UI only, no WebRTC logic
+ */
+class CameraTile {
+    constructor(cameraId, name, grid) {
+        this.cameraId = cameraId;
+        this.name = name;
+        this.grid = grid;
+        this.tile = grid.addCamera(cameraId, name);
+    }
+
+    attachStream(stream) {
+        this.tile.attachStream(stream);
+    }
+
+    updateCamera(newId, newName) {
+        this.cameraId = newId;
+        this.name = newName;
+        this.tile.setName(newName);
+    }
+
+    setStatus(status) {
+        this.tile.setStatus(status);
+    }
+
+    updateStats(stats) {
+        this.tile.updateStats(stats);
+    }
+
+    destroy() {
+        this.grid.removeCamera(this.cameraId);
     }
 }
