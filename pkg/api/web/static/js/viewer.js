@@ -78,6 +78,8 @@ export class Viewer {
         const data = await response.json();
         this.sessionId = data.sessionId;
         console.log('[Viewer] Created single viewer session:', this.sessionId);
+        console.log(`[Viewer] ✓ Single session created: ${this.sessionId}`);
+        console.log(`[Viewer] Architecture: 1 session for ALL cameras (not 1 per camera)`);
 
         // Create ONE PeerConnection
         this.pc = new RTCPeerConnection({
@@ -165,6 +167,7 @@ export class Viewer {
             }
 
             this.updateCameraCount(this.cameras.size);
+            console.log(`[Viewer] Stats: 1 session, ${this.cameras.size} cameras, ${this.trackMids.size} tracks`);
 
         } catch (error) {
             console.error('[Viewer] Error refreshing cameras:', error);
@@ -189,6 +192,8 @@ export class Viewer {
         }
 
         console.log('[Viewer] Pulling tracks for', camerasData.length, 'cameras:', tracks);
+        console.log(`[Viewer] Pulling ${camerasData.length} camera tracks into session ${this.sessionId}`);
+        console.log(`[Viewer] Total API calls: 1 (batch), not ${camerasData.length} (old architecture)`);
 
         const response = await fetch(`/api/cf/sessions/${this.sessionId}/tracks/new`, {
             method: 'POST',
