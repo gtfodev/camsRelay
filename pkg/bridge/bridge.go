@@ -80,12 +80,12 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 	// Create media engine with H264 and Opus
 	m := &webrtc.MediaEngine{}
 
-	// Register H264 codec
+	// Register H264 codec (Main Profile to match Nest camera output)
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f",
 		},
 		PayloadType: 96,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -276,6 +276,7 @@ func (b *Bridge) WriteVideoRTP(packet *rtp.Packet) error {
 }
 
 // WriteVideoSample writes H.264 video data as a sample with proper RTP packetization
+// The input data is expected to be in AVC format (4-byte length prefix per NAL unit)
 func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 	if b.videoTrack == nil {
 		return fmt.Errorf("video track not initialized")
@@ -284,46 +285,57 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 	b.videoMu.Lock()
 	defer b.videoMu.Unlock()
 
-	// Use H264Payloader to fragment NAL unit into MTU-sized RTP packets
-	// MTU is set to 1200 bytes (safe for WebRTC with overhead for RTP/UDP/IP headers)
-	const mtu = 1200
-	payloads := b.h264Payloader.Payload(mtu, data)
+	// Extract NAL units from AVC format (4-byte length prefix per NALU)
+	// The H264Payloader expects raw NAL units without length prefixes
+	nalus, err := extractNALUs(data)
+	if err != nil {
+		return fmt.Errorf("extract NAL units: %w", err)
+	}
 
 	// Get current timestamp and sequence number
 	timestamp := b.videoTS
 	seqNum := b.videoSeqNum
 
-	// Write each fragmented payload as a separate RTP packet
-	for i, payload := range payloads {
-		// Create RTP packet
-		packet := &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				PayloadType:    96, // H.264 payload type
-				SequenceNumber: seqNum,
-				Timestamp:      timestamp,
-				Marker:         i == len(payloads)-1, // Mark last packet in frame
-			},
-			Payload: payload,
-		}
+	// Packetize and send each NAL unit
+	const mtu = 1200 // Safe MTU for WebRTC
+	for naluIdx, nalu := range nalus {
+		// Use H264Payloader to fragment NAL unit into MTU-sized RTP packets
+		payloads := b.h264Payloader.Payload(mtu, nalu)
 
-		// Write packet to track
-		if err := b.videoTrack.WriteRTP(packet); err != nil {
-			if err == io.ErrClosedPipe {
-				return nil // Track closed gracefully
+		// Write each fragmented payload as a separate RTP packet
+		for i, payload := range payloads {
+			// Create RTP packet
+			packet := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					PayloadType:    96, // H.264 payload type
+					SequenceNumber: seqNum,
+					Timestamp:      timestamp,
+					// Mark last packet of last NAL unit in frame
+					Marker: (naluIdx == len(nalus)-1) && (i == len(payloads)-1),
+				},
+				Payload: payload,
 			}
-			// Log connection state on write error to diagnose timing issues
-			b.logger.Error("failed to write RTP packet",
-				"packet_num", i+1,
-				"total_packets", len(payloads),
-				"connection_state", b.GetConnectionState().String(),
-				"error", err)
-			return fmt.Errorf("write RTP packet %d/%d (state=%s): %w",
-				i+1, len(payloads), b.GetConnectionState().String(), err)
-		}
 
-		// Increment sequence number for next packet
-		seqNum++
+			// Write packet to track
+			if err := b.videoTrack.WriteRTP(packet); err != nil {
+				if err == io.ErrClosedPipe {
+					return nil // Track closed gracefully
+				}
+				b.logger.Error("failed to write RTP packet",
+					"nalu", naluIdx+1,
+					"total_nalus", len(nalus),
+					"packet_num", i+1,
+					"total_packets", len(payloads),
+					"connection_state", b.GetConnectionState().String(),
+					"error", err)
+				return fmt.Errorf("write RTP packet NALU %d/%d pkt %d/%d (state=%s): %w",
+					naluIdx+1, len(nalus), i+1, len(payloads), b.GetConnectionState().String(), err)
+			}
+
+			// Increment sequence number for next packet
+			seqNum++
+		}
 	}
 
 	// Update sequence number and timestamp for next sample
@@ -335,6 +347,38 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 	b.videoTS += timestampIncrement
 
 	return nil
+}
+
+// extractNALUs extracts individual NAL units from AVC format data
+// AVC format: [4-byte length][NAL data][4-byte length][NAL data]...
+// Returns slice of raw NAL units (without length prefixes)
+func extractNALUs(data []byte) ([][]byte, error) {
+	var nalus [][]byte
+	offset := 0
+
+	for offset < len(data) {
+		// Need at least 4 bytes for length prefix
+		if offset+4 > len(data) {
+			return nil, fmt.Errorf("incomplete NAL unit at offset %d: need 4 bytes for length, have %d", offset, len(data)-offset)
+		}
+
+		// Read 4-byte big-endian length
+		naluLen := int(data[offset])<<24 | int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
+		offset += 4
+
+		// Validate length
+		if offset+naluLen > len(data) {
+			return nil, fmt.Errorf("invalid NAL unit length %d at offset %d: exceeds data bounds", naluLen, offset-4)
+		}
+
+		// Extract NAL unit (without length prefix)
+		nalu := data[offset : offset+naluLen]
+		nalus = append(nalus, nalu)
+
+		offset += naluLen
+	}
+
+	return nalus, nil
 }
 
 // WriteAudioRTP writes an audio RTP packet to the WebRTC track

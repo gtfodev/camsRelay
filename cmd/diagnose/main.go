@@ -2,66 +2,110 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
 	"github.com/ethan/nest-cloudflare-relay/pkg/config"
-	"github.com/pion/rtcp"
+	"github.com/ethan/nest-cloudflare-relay/pkg/logger"
+	"github.com/ethan/nest-cloudflare-relay/pkg/nest"
+	"github.com/ethan/nest-cloudflare-relay/pkg/rtsp"
 	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 )
 
-// Diagnostic tool to analyze RTP flow and RTCP feedback for Cloudflare Calls
-// This tool creates a minimal test pattern to identify where the video flow breaks.
+// Diagnostic tool to verify fundamental NAL unit flow from Nest to Cloudflare
+// This tool answers 4 critical questions:
+// 1. Are SPS/PPS being extracted from RTSP and forwarded?
+// 2. Are keyframes (IDR) coming from Nest at all?
+// 3. What does Cloudflare session status show?
+// 4. How many frames are we actually sending to Cloudflare?
 
-type DiagnosticSession struct {
-	logger      *slog.Logger
-	cfClient    *cloudflare.Client
-	pc          *webrtc.PeerConnection
-	videoTrack  *webrtc.TrackLocalStaticRTP
-	sessionID   string
+const (
+	NALUTypePFrame = 1
+	NALUTypeIDR    = 5
+	NALUTypeSEI    = 6
+	NALUTypeSPS    = 7
+	NALUTypePPS    = 8
+	NALUTypeAUD    = 9
+)
 
-	// Diagnostics counters
-	rtpSent         atomic.Uint64
-	rtcpReceived    atomic.Uint64
-	pliReceived     atomic.Uint64
-	firReceived     atomic.Uint64
-	nackReceived    atomic.Uint64
-	senderReports   atomic.Uint64
-	receiverReports atomic.Uint64
+type Diagnostics struct {
+	// NAL unit counters
+	spsReceived    atomic.Uint64
+	ppsReceived    atomic.Uint64
+	idrReceived    atomic.Uint64
+	pframeReceived atomic.Uint64
+	otherReceived  atomic.Uint64
 
-	// State tracking
+	// Frame forwarding counters
+	packetsSentToCF atomic.Uint64
+	writeErrors     atomic.Uint64
+
+	// Timing
 	startTime       time.Time
-	lastRTCPTime    time.Time
-	connectionState atomic.Value // webrtc.PeerConnectionState
+	firstIDRTime    time.Time
+	lastIDRTime     time.Time
+	idrInterval     time.Duration
 
-	// RTCP handler
-	rtcpReader *webrtc.RTPReceiver
+	logger *logger.Logger
 }
 
 func main() {
-	// Initialize logger with debug level for maximum verbosity
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
+	// Parse command-line flags
+	fs := flag.NewFlagSet("diagnose", flag.ExitOnError)
+	logFlags := logger.RegisterFlags(fs)
 
-	logger.Info("=== Cloudflare Calls RTP Flow Diagnostic Tool ===")
-	logger.Info("This tool will:")
-	logger.Info("  1. Create a Cloudflare session")
-	logger.Info("  2. Send test H.264 RTP packets")
-	logger.Info("  3. Monitor for RTCP feedback (PLI, FIR, NACK)")
-	logger.Info("  4. Verify continuous flow and log everything")
-	logger.Info("")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "NAL Unit Flow Diagnostic Tool\n\n")
+		fmt.Fprintf(os.Stderr, "This tool will:\n")
+		fmt.Fprintf(os.Stderr, "  1. Connect to a real Nest camera via RTSP\n")
+		fmt.Fprintf(os.Stderr, "  2. Parse and log NAL units (SPS, PPS, IDR, P-frames)\n")
+		fmt.Fprintf(os.Stderr, "  3. Forward RTP packets to Cloudflare\n")
+		fmt.Fprintf(os.Stderr, "  4. Track what was sent vs what was received\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fs.PrintDefaults()
+		logger.PrintUsageExamples()
+	}
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize logger from flags
+	logConfig, err := logFlags.ToConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error configuring logger: %v\n", err)
+		os.Exit(1)
+	}
+
+	lgr, err := logger.New(logConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer lgr.Close()
+
+	logger.SetDefault(lgr)
+
+	lgr.Info("=== NAL Unit Flow Diagnostic Tool ===",
+		"log_config", logFlags.String())
+	lgr.Info("This tool will:")
+	lgr.Info("  1. Connect to a real Nest camera via RTSP")
+	lgr.Info("  2. Parse and log NAL units (SPS, PPS, IDR, P-frames)")
+	lgr.Info("  3. Forward RTP packets to Cloudflare")
+	lgr.Info("  4. Track what was sent vs what was received")
+	lgr.Info("")
 
 	// Load config
 	cfg, err := config.Load(".env")
@@ -69,115 +113,380 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Create Cloudflare client
+	diag := &Diagnostics{
+		logger:    lgr,
+		startTime: time.Now(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create clients
+	nestClient := nest.NewClient(
+		cfg.Google.ClientID,
+		cfg.Google.ClientSecret,
+		cfg.Google.RefreshToken,
+		lgr.With("component", "nest").Logger,
+	)
+
 	cfClient := cloudflare.NewClient(
 		cfg.Cloudflare.AppID,
 		cfg.Cloudflare.APIToken,
-		logger.With("component", "cloudflare"),
+		lgr.With("component", "cloudflare").Logger,
 	)
 
-	// Create diagnostic session
-	session := &DiagnosticSession{
-		logger:   logger,
-		cfClient: cfClient,
-		startTime: time.Now(),
+	// List devices
+	devices, err := nestClient.ListDevices(ctx, cfg.Google.ProjectID)
+	if err != nil {
+		log.Fatalf("Failed to list devices: %v", err)
 	}
-	session.connectionState.Store(webrtc.PeerConnectionStateNew)
 
-	ctx := context.Background()
-
-	// Create session and establish WebRTC connection
-	if err := session.createSession(ctx); err != nil {
-		log.Fatalf("Failed to create session: %v", err)
+	if len(devices) == 0 {
+		log.Fatalf("No camera devices found")
 	}
+
+	// Use first camera
+	camera := devices[0]
+	lgr.Info("using camera",
+		"name", camera.Traits.Info.CustomName,
+		"device_id", camera.DeviceID)
+
+	// Generate RTSP stream
+	lgr.Info("generating RTSP stream...")
+	stream, err := nestClient.GenerateRTSPStream(ctx, cfg.Google.ProjectID, camera.DeviceID)
+	if err != nil {
+		log.Fatalf("Failed to generate RTSP stream: %v", err)
+	}
+
+	lgr.Info("RTSP stream generated",
+		"url", stream.URL,
+		"expires_at", stream.ExpiresAt.Format(time.RFC3339))
+
+	// Create Cloudflare session
+	lgr.Info("creating Cloudflare session...")
+	session, err := cfClient.CreateSession(ctx)
+	if err != nil {
+		log.Fatalf("Failed to create Cloudflare session: %v", err)
+	}
+	lgr.Info("Cloudflare session created", "session_id", session.SessionID)
+
+	// Setup WebRTC
+	videoTrack, pc, err := setupWebRTC(ctx, cfClient, session.SessionID, lgr.Logger)
+	if err != nil {
+		log.Fatalf("Failed to setup WebRTC: %v", err)
+	}
+	defer pc.Close()
 
 	// Wait for connection
-	if err := session.waitForConnection(ctx); err != nil {
-		log.Fatalf("Failed to wait for connection: %v", err)
+	lgr.Info("waiting for WebRTC connection...")
+	if err := waitForConnection(ctx, pc, lgr.Logger); err != nil {
+		log.Fatalf("Failed to establish connection: %v", err)
+	}
+	lgr.Info("✓ WebRTC connection established")
+
+	// Connect to RTSP stream
+	lgr.Info("connecting to RTSP stream...")
+	rtspClient := rtsp.NewClient(stream.URL, lgr.With("component", "rtsp").Logger)
+	if err := rtspClient.Connect(ctx); err != nil {
+		log.Fatalf("Failed to connect to RTSP: %v", err)
+	}
+	defer rtspClient.Close()
+
+	// Setup tracks
+	if err := rtspClient.SetupTracks(ctx); err != nil {
+		log.Fatalf("Failed to setup RTSP tracks: %v", err)
 	}
 
-	logger.Info("✓ WebRTC connection established - starting test pattern")
+	// Set RTP packet handler
+	rtspClient.OnRTPPacket = func(channel byte, packet *rtp.Packet) {
+		diag.processRTPPacket(packet, videoTrack)
+	}
 
-	// Start RTCP monitoring goroutine
-	go session.monitorRTCP(ctx)
+	// Start playing
+	if err := rtspClient.Play(ctx); err != nil {
+		log.Fatalf("Failed to start RTSP playback: %v", err)
+	}
 
-	// Start sending test pattern
-	go session.sendTestPattern(ctx)
+	lgr.Info("✓ RTSP stream playing - monitoring for 60 seconds...")
 
-	// Run for 30 seconds
-	logger.Info("Running diagnostic for 30 seconds...")
-
+	// Run for 60 seconds
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// Start periodic reporting
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		if err := rtspClient.ReadPackets(ctx); err != nil {
+			lgr.Error("RTSP read loop error", "error", err)
+		}
+		close(done)
+	}()
+
 	select {
-	case <-time.After(30 * time.Second):
-		logger.Info("Diagnostic duration completed")
+	case <-time.After(60 * time.Second):
+		lgr.Info("diagnostic duration completed")
 	case <-sigChan:
-		logger.Info("Interrupted by user")
+		lgr.Info("interrupted by user")
+	case <-done:
+		lgr.Info("RTSP stream ended")
+	case <-ticker.C:
+		diag.printInterimReport()
 	}
 
-	// Print summary
-	session.printSummary()
+	cancel()
 
-	// Cleanup
-	if session.pc != nil {
-		session.pc.Close()
-	}
-
-	logger.Info("Diagnostic complete")
+	// Final report
+	diag.printFinalReport(session.SessionID)
 }
 
-func (s *DiagnosticSession) createSession(ctx context.Context) error {
-	s.logger.Info("Creating Cloudflare session...")
-
-	// Create Cloudflare session
-	sessionResp, err := s.cfClient.CreateSession(ctx)
-	if err != nil {
-		return fmt.Errorf("create session: %w", err)
+func (d *Diagnostics) processRTPPacket(packet *rtp.Packet, track *webrtc.TrackLocalStaticRTP) {
+	if len(packet.Payload) == 0 {
+		return
 	}
-	s.sessionID = sessionResp.SessionID
-	s.logger.Info("✓ Cloudflare session created", "session_id", s.sessionID)
 
-	// Create PeerConnection with detailed logging
+	// Debug log RTP packet if enabled
+	d.logger.DebugRTPPacket(packet.SequenceNumber, packet.Timestamp, packet.PayloadType, len(packet.Payload))
+
+	// Parse NAL unit type
+	payload := packet.Payload
+	naluType := payload[0] & 0x1F
+
+	// Handle fragmented NAL units (FU-A)
+	if naluType == 28 { // FU-A
+		if len(payload) < 2 {
+			return
+		}
+		fuHeader := payload[1]
+		naluType = fuHeader & 0x1F
+		start := (fuHeader & 0x80) != 0
+
+		// Only log when we see the start of a fragmented NALU
+		if start {
+			d.logNALU(naluType, len(payload), true)
+			// Debug log NAL payload if enabled
+			d.logger.DebugNALPayload(naluType, payload)
+		}
+	} else {
+		// Single NAL unit
+		d.logNALU(naluType, len(payload), false)
+		// Debug log NAL payload if enabled
+		d.logger.DebugNALPayload(naluType, payload)
+	}
+
+	// Forward packet to Cloudflare
+	if err := track.WriteRTP(packet); err != nil {
+		d.writeErrors.Add(1)
+		if d.writeErrors.Load()%100 == 1 {
+			d.logger.Error("write RTP error", "error", err, "error_count", d.writeErrors.Load())
+		}
+	} else {
+		d.packetsSentToCF.Add(1)
+	}
+}
+
+func (d *Diagnostics) logNALU(naluType uint8, size int, fragmented bool) {
+	fragStr := ""
+	if fragmented {
+		fragStr = " [fragmented]"
+	}
+
+	switch naluType {
+	case NALUTypeSPS:
+		count := d.spsReceived.Add(1)
+		d.logger.Info(fmt.Sprintf(">>> SPS received%s", fragStr),
+			"count", count,
+			"size", size,
+			"elapsed", time.Since(d.startTime).Round(time.Millisecond))
+
+	case NALUTypePPS:
+		count := d.ppsReceived.Add(1)
+		d.logger.Info(fmt.Sprintf(">>> PPS received%s", fragStr),
+			"count", count,
+			"size", size,
+			"elapsed", time.Since(d.startTime).Round(time.Millisecond))
+
+	case NALUTypeIDR:
+		count := d.idrReceived.Add(1)
+		now := time.Now()
+
+		if d.firstIDRTime.IsZero() {
+			d.firstIDRTime = now
+		} else {
+			// Calculate interval since last IDR
+			interval := now.Sub(d.lastIDRTime)
+			d.idrInterval = interval
+		}
+		d.lastIDRTime = now
+
+		d.logger.Info(fmt.Sprintf(">>> IDR KEYFRAME received%s", fragStr),
+			"count", count,
+			"size", size,
+			"interval", d.idrInterval.Round(time.Millisecond),
+			"elapsed", time.Since(d.startTime).Round(time.Millisecond))
+
+	case NALUTypePFrame:
+		count := d.pframeReceived.Add(1)
+		// Only log every 100th P-frame to avoid spam
+		if count%100 == 1 {
+			d.logger.Debug("P-frames received", "count", count)
+		}
+
+	default:
+		count := d.otherReceived.Add(1)
+		if count < 10 {
+			d.logger.Debug(fmt.Sprintf("other NAL unit received%s", fragStr),
+				"type", naluType,
+				"size", size)
+		}
+	}
+}
+
+func (d *Diagnostics) printInterimReport() {
+	elapsed := time.Since(d.startTime).Round(time.Second)
+	d.logger.Info("--- Interim Report ---",
+		"elapsed", elapsed,
+		"sps", d.spsReceived.Load(),
+		"pps", d.ppsReceived.Load(),
+		"idr", d.idrReceived.Load(),
+		"pframes", d.pframeReceived.Load(),
+		"packets_sent", d.packetsSentToCF.Load(),
+		"write_errors", d.writeErrors.Load())
+}
+
+func (d *Diagnostics) printFinalReport(sessionID string) {
+	elapsed := time.Since(d.startTime).Round(time.Second)
+
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("DIAGNOSTIC RESULTS")
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("Duration: %s\n", elapsed)
+	fmt.Printf("Session ID: %s\n\n", sessionID)
+
+	fmt.Println("NAL UNITS RECEIVED FROM NEST:")
+	fmt.Printf("  SPS received:     %d\n", d.spsReceived.Load())
+	fmt.Printf("  PPS received:     %d\n", d.ppsReceived.Load())
+	fmt.Printf("  IDR keyframes:    %d\n", d.idrReceived.Load())
+	if d.idrReceived.Load() > 1 {
+		fmt.Printf("  IDR interval:     ~%s\n", d.idrInterval.Round(time.Millisecond))
+	}
+	fmt.Printf("  P-frames:         %d\n", d.pframeReceived.Load())
+	fmt.Printf("  Other NALUs:      %d\n\n", d.otherReceived.Load())
+
+	fmt.Println("FORWARDING TO CLOUDFLARE:")
+	fmt.Printf("  Packets sent:     %d\n", d.packetsSentToCF.Load())
+	fmt.Printf("  Write errors:     %d\n\n", d.writeErrors.Load())
+
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Println("ANSWERS TO KEY QUESTIONS:")
+	fmt.Println(strings.Repeat("=", 80))
+
+	// Question 1: SPS/PPS forwarded?
+	if d.spsReceived.Load() > 0 && d.ppsReceived.Load() > 0 {
+		fmt.Println("1. SPS/PPS forwarded: YES")
+		fmt.Printf("   - SPS count: %d\n", d.spsReceived.Load())
+		fmt.Printf("   - PPS count: %d\n", d.ppsReceived.Load())
+	} else {
+		fmt.Println("1. SPS/PPS forwarded: NO")
+		fmt.Println("   ❌ CRITICAL: Missing parameter sets!")
+	}
+
+	// Question 2: Keyframes from Nest?
+	if d.idrReceived.Load() > 0 {
+		fmt.Println("\n2. Keyframes from Nest: YES")
+		fmt.Printf("   - IDR count: %d\n", d.idrReceived.Load())
+		if d.idrReceived.Load() > 1 {
+			fmt.Printf("   - Interval: ~%s\n", d.idrInterval.Round(time.Millisecond))
+		}
+	} else {
+		fmt.Println("\n2. Keyframes from Nest: NO")
+		fmt.Println("   ❌ CRITICAL: No IDR frames received!")
+	}
+
+	// Question 3: Browser stats (manual check needed)
+	fmt.Println("\n3. Browser RTCPeerConnection.getStats():")
+	fmt.Println("   ⚠️  MANUAL CHECK REQUIRED")
+	fmt.Println("   - Open browser console")
+	fmt.Println("   - Run: pc.getStats().then(stats => { stats.forEach(s => { if(s.type === 'inbound-rtp' && s.kind === 'video') console.log(s) }) })")
+	fmt.Println("   - Check: framesDecoded value (should be > 0 and incrementing)")
+
+	// Question 4: Cloudflare session active?
+	fmt.Printf("\n4. Cloudflare track status: CHECK SESSION %s\n", sessionID)
+	if d.packetsSentToCF.Load() > 0 {
+		fmt.Println("   - Packets were sent successfully: YES")
+	} else {
+		fmt.Println("   - Packets were sent successfully: NO")
+	}
+	fmt.Printf("   - Total packets: %d\n", d.packetsSentToCF.Load())
+	if d.writeErrors.Load() > 0 {
+		fmt.Printf("   - ⚠️  Write errors: %d\n", d.writeErrors.Load())
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("ROOT CAUSE ANALYSIS:")
+	fmt.Println(strings.Repeat("=", 80))
+
+	if d.spsReceived.Load() == 0 || d.ppsReceived.Load() == 0 {
+		fmt.Println("❌ CRITICAL: SPS/PPS not received from Nest")
+		fmt.Println("   → Decoder cannot initialize without parameter sets")
+		fmt.Println("   → ACTION: Check RTSP SDP parsing and NAL unit extraction")
+	} else if d.idrReceived.Load() == 0 {
+		fmt.Println("❌ CRITICAL: No keyframes received from Nest")
+		fmt.Println("   → Decoder cannot start without initial IDR frame")
+		fmt.Println("   → ACTION: Verify RTSP stream is actually providing video data")
+	} else if d.packetsSentToCF.Load() == 0 {
+		fmt.Println("❌ CRITICAL: No packets sent to Cloudflare")
+		fmt.Println("   → WebRTC track not accepting writes")
+		fmt.Println("   → ACTION: Check WebRTC connection state and track setup")
+	} else if d.writeErrors.Load() > d.packetsSentToCF.Load()/10 {
+		fmt.Println("⚠️  WARNING: High error rate when writing to Cloudflare")
+		fmt.Printf("   → Error rate: %.1f%%\n", float64(d.writeErrors.Load())/float64(d.packetsSentToCF.Load())*100)
+		fmt.Println("   → ACTION: Check connection stability and error logs")
+	} else {
+		fmt.Println("✓ All fundamental checks PASSED")
+		fmt.Println("  → SPS/PPS are being received and forwarded")
+		fmt.Println("  → Keyframes are coming from Nest regularly")
+		fmt.Println("  → Packets are being sent to Cloudflare successfully")
+		fmt.Println("")
+		fmt.Println("If video is still black in browser:")
+		fmt.Println("  → Check browser console for framesDecoded (question 3)")
+		fmt.Println("  → Verify Cloudflare session is active")
+		fmt.Println("  → Check for RTCP PLI/FIR requests indicating decode errors")
+	}
+
+	fmt.Println(strings.Repeat("=", 80))
+}
+
+func setupWebRTC(ctx context.Context, cfClient *cloudflare.Client, sessionID string, logger *slog.Logger) (*webrtc.TrackLocalStaticRTP, *webrtc.PeerConnection, error) {
+	// Create media engine with H264 (Main Profile to match Nest camera output)
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f",
+		},
+		PayloadType: 96,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, nil, fmt.Errorf("register H264 codec: %w", err)
+	}
+
+	// Create API with media engine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+
+	// Create peer connection
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
 	}
 
-	// Create media engine with H264
-	m := &webrtc.MediaEngine{}
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
-		return fmt.Errorf("register H264 codec: %w", err)
-	}
-
-	// Create API with media engine
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
-
 	pc, err := api.NewPeerConnection(config)
 	if err != nil {
-		return fmt.Errorf("create peer connection: %w", err)
+		return nil, nil, fmt.Errorf("create peer connection: %w", err)
 	}
-	s.pc = pc
-
-	// Setup connection state handler
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		s.connectionState.Store(state)
-		s.logger.Info(">>> Connection state changed", "state", state.String())
-	})
-
-	// Setup ICE connection state handler
-	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		s.logger.Info(">>> ICE connection state changed", "state", state.String())
-	})
 
 	// Create video track
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
@@ -186,47 +495,42 @@ func (s *DiagnosticSession) createSession(ctx context.Context) error {
 			ClockRate: 90000,
 		},
 		"video",
-		"diagnostic-video",
+		"nest-camera-video",
 	)
 	if err != nil {
-		return fmt.Errorf("create video track: %w", err)
-	}
-	s.videoTrack = videoTrack
-
-	// Add track and capture RTPSender
-	rtpSender, err := pc.AddTrack(videoTrack)
-	if err != nil {
-		return fmt.Errorf("add track: %w", err)
+		pc.Close()
+		return nil, nil, fmt.Errorf("create video track: %w", err)
 	}
 
-	s.logger.Info("✓ Video track added to peer connection")
-
-	// Setup RTCP packet handler on the RTPSender
-	// This is CRITICAL - we need to read RTCP feedback from Cloudflare
-	go s.readRTCP(rtpSender)
+	if _, err := pc.AddTrack(videoTrack); err != nil {
+		pc.Close()
+		return nil, nil, fmt.Errorf("add video track: %w", err)
+	}
 
 	// Create offer
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		return fmt.Errorf("create offer: %w", err)
+		pc.Close()
+		return nil, nil, fmt.Errorf("create offer: %w", err)
 	}
 
 	if err := pc.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("set local description: %w", err)
+		pc.Close()
+		return nil, nil, fmt.Errorf("set local description: %w", err)
 	}
 
 	// Wait for ICE gathering
 	gatherComplete := webrtc.GatheringCompletePromise(pc)
 	select {
 	case <-gatherComplete:
-		s.logger.Info("✓ ICE gathering complete")
 	case <-time.After(10 * time.Second):
-		return fmt.Errorf("ICE gathering timeout")
+		pc.Close()
+		return nil, nil, fmt.Errorf("ICE gathering timeout")
 	}
 
 	localSDP := pc.LocalDescription().SDP
 
-	// Get mids
+	// Get video mid
 	var videoMid string
 	for _, t := range pc.GetTransceivers() {
 		if t.Mid() != "" && t.Kind() == webrtc.RTPCodecTypeVideo {
@@ -234,8 +538,6 @@ func (s *DiagnosticSession) createSession(ctx context.Context) error {
 			break
 		}
 	}
-
-	s.logger.Info("✓ SDP offer created", "video_mid", videoMid)
 
 	// Send to Cloudflare
 	tracksReq := &cloudflare.TracksRequest{
@@ -252,13 +554,15 @@ func (s *DiagnosticSession) createSession(ctx context.Context) error {
 		},
 	}
 
-	tracksResp, err := s.cfClient.AddTracksWithRetry(ctx, s.sessionID, tracksReq, 3)
+	tracksResp, err := cfClient.AddTracksWithRetry(ctx, sessionID, tracksReq, 3)
 	if err != nil {
-		return fmt.Errorf("add tracks: %w", err)
+		pc.Close()
+		return nil, nil, fmt.Errorf("add tracks: %w", err)
 	}
 
 	if tracksResp.SessionDescription == nil {
-		return fmt.Errorf("no SDP answer from Cloudflare")
+		pc.Close()
+		return nil, nil, fmt.Errorf("no SDP answer from Cloudflare")
 	}
 
 	// Set remote description
@@ -268,16 +572,22 @@ func (s *DiagnosticSession) createSession(ctx context.Context) error {
 	}
 
 	if err := pc.SetRemoteDescription(answer); err != nil {
-		return fmt.Errorf("set remote description: %w", err)
+		pc.Close()
+		return nil, nil, fmt.Errorf("set remote description: %w", err)
 	}
 
-	s.logger.Info("✓ SDP negotiation complete")
-	return nil
+	return videoTrack, pc, nil
 }
 
-func (s *DiagnosticSession) waitForConnection(ctx context.Context) error {
+func waitForConnection(ctx context.Context, pc *webrtc.PeerConnection, logger *slog.Logger) error {
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+
+	stateChan := make(chan webrtc.PeerConnectionState, 1)
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		logger.Info("connection state changed", "state", state.String())
+		stateChan <- state
+	})
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -285,323 +595,19 @@ func (s *DiagnosticSession) waitForConnection(ctx context.Context) error {
 	for {
 		select {
 		case <-waitCtx.Done():
-			state := s.connectionState.Load().(webrtc.PeerConnectionState)
-			return fmt.Errorf("timeout waiting for connection (state=%s): %w", state.String(), waitCtx.Err())
-		case <-ticker.C:
-			state := s.connectionState.Load().(webrtc.PeerConnectionState)
-
+			return fmt.Errorf("timeout waiting for connection: %w", waitCtx.Err())
+		case state := <-stateChan:
 			if state == webrtc.PeerConnectionStateConnected {
-				s.logger.Info("✓ Connection established")
 				return nil
 			}
-
 			if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 				return fmt.Errorf("connection failed: state=%s", state.String())
 			}
-		}
-	}
-}
-
-// readRTCP reads RTCP packets from the RTPSender
-// This is where we'll see PLI, FIR, NACK, and other feedback
-func (s *DiagnosticSession) readRTCP(rtpSender *webrtc.RTPSender) {
-	s.logger.Info(">>> Starting RTCP read loop")
-
-	for {
-		packets, _, err := rtpSender.ReadRTCP()
-		if err != nil {
-			if err == io.EOF || err == io.ErrClosedPipe {
-				s.logger.Info(">>> RTCP read loop ended (connection closed)")
-				return
-			}
-			s.logger.Error(">>> RTCP read error", "error", err)
-			continue
-		}
-
-		s.rtcpReceived.Add(uint64(len(packets)))
-		s.lastRTCPTime = time.Now()
-
-		for _, packet := range packets {
-			s.logger.Info(">>> RTCP PACKET RECEIVED",
-				"type", fmt.Sprintf("%T", packet),
-				"elapsed", time.Since(s.startTime).Round(time.Millisecond))
-
-			switch pkt := packet.(type) {
-			case *rtcp.PictureLossIndication:
-				s.pliReceived.Add(1)
-				s.logger.Warn("!!! PLI RECEIVED !!!",
-					"media_ssrc", pkt.MediaSSRC,
-					"sender_ssrc", pkt.SenderSSRC,
-					"description", "Cloudflare is requesting a keyframe - decoder needs IDR frame")
-
-			case *rtcp.FullIntraRequest:
-				s.firReceived.Add(1)
-				s.logger.Warn("!!! FIR RECEIVED !!!",
-					"media_ssrc", pkt.MediaSSRC,
-					"description", "Cloudflare is requesting full intra refresh")
-
-			case *rtcp.TransportLayerNack:
-				s.nackReceived.Add(1)
-				s.logger.Warn("!!! NACK RECEIVED !!!",
-					"media_ssrc", pkt.MediaSSRC,
-					"sender_ssrc", pkt.SenderSSRC,
-					"nacks", len(pkt.Nacks),
-					"description", "Cloudflare detected packet loss")
-				for i, nack := range pkt.Nacks {
-					s.logger.Info("    NACK detail",
-						"index", i,
-						"packet_id", nack.PacketID,
-						"lost_packets", nack.LostPackets)
-				}
-
-			case *rtcp.ReceiverReport:
-				s.receiverReports.Add(1)
-				s.logger.Debug(">>> Receiver Report",
-					"reports", len(pkt.Reports))
-				for i, report := range pkt.Reports {
-					s.logger.Debug("    RR detail",
-						"index", i,
-						"ssrc", report.SSRC,
-						"fraction_lost", report.FractionLost,
-						"total_lost", report.TotalLost,
-						"last_seq", report.LastSequenceNumber,
-						"jitter", report.Jitter)
-				}
-
-			case *rtcp.SenderReport:
-				s.senderReports.Add(1)
-				s.logger.Debug(">>> Sender Report",
-					"ssrc", pkt.SSRC,
-					"ntp_time", pkt.NTPTime,
-					"rtp_time", pkt.RTPTime,
-					"packet_count", pkt.PacketCount,
-					"octet_count", pkt.OctetCount)
-
-			default:
-				s.logger.Info(">>> Other RTCP packet",
-					"type", fmt.Sprintf("%T", pkt))
-			}
-		}
-	}
-}
-
-// monitorRTCP periodically checks if we're receiving RTCP
-func (s *DiagnosticSession) monitorRTCP(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
 		case <-ticker.C:
-			rtcpCount := s.rtcpReceived.Load()
-			timeSinceLast := time.Since(s.lastRTCPTime)
-
-			if rtcpCount == 0 {
-				s.logger.Warn("⚠️  NO RTCP RECEIVED YET",
-					"elapsed", time.Since(s.startTime).Round(time.Second))
-			} else if timeSinceLast > 10*time.Second {
-				s.logger.Warn("⚠️  No RTCP for 10+ seconds",
-					"last_rtcp", timeSinceLast.Round(time.Second))
+			state := pc.ConnectionState()
+			if state == webrtc.PeerConnectionStateConnected {
+				return nil
 			}
 		}
 	}
-}
-
-// sendTestPattern sends H.264 test RTP packets
-// Sends a simple pattern: IDR keyframe every 2 seconds, P-frames in between
-func (s *DiagnosticSession) sendTestPattern(ctx context.Context) {
-	s.logger.Info(">>> Starting test pattern transmission")
-
-	// Create H264 payloader
-	payloader := &codecs.H264Payloader{}
-	const mtu = 1200
-
-	// Sequence number and timestamp
-	var seqNum uint16 = 1000
-	var timestamp uint32 = 0
-
-	// Test NALU patterns
-	// IDR frame: SPS + PPS + IDR slice
-	sps := []byte{0x67, 0x42, 0xe0, 0x1f, 0x8c, 0x8d, 0x40, 0x50, 0x17, 0xfc, 0xb0, 0x0f, 0x08, 0x84, 0x6a}
-	pps := []byte{0x68, 0xce, 0x3c, 0x80}
-	idr := make([]byte, 1000) // Dummy IDR slice
-	idr[0] = 0x65 // IDR NALU type
-	for i := 1; i < len(idr); i++ {
-		idr[i] = byte(i % 256)
-	}
-
-	// P-frame
-	pframe := make([]byte, 800)
-	pframe[0] = 0x41 // P-frame NALU type
-	for i := 1; i < len(pframe); i++ {
-		pframe[i] = byte(i % 256)
-	}
-
-	ticker := time.NewTicker(33 * time.Millisecond) // ~30fps
-	defer ticker.Stop()
-
-	frameCount := 0
-	keyframeInterval := 60 // Keyframe every 2 seconds @ 30fps
-
-	s.logger.Info(">>> Sending first keyframe (SPS + PPS + IDR)")
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			frameCount++
-			isKeyframe := frameCount%keyframeInterval == 1
-
-			if isKeyframe {
-				// Send keyframe: SPS + PPS + IDR
-				s.logger.Info(">>> Sending KEYFRAME",
-					"frame", frameCount,
-					"seq_start", seqNum,
-					"timestamp", timestamp)
-
-				// Send SPS
-				seqNum = s.sendNALU(sps, seqNum, timestamp, payloader, mtu, false)
-				// Send PPS
-				seqNum = s.sendNALU(pps, seqNum, timestamp, payloader, mtu, false)
-				// Send IDR
-				seqNum = s.sendNALU(idr, seqNum, timestamp, payloader, mtu, true)
-			} else {
-				// Send P-frame
-				if frameCount%300 == 0 { // Log every 10 seconds
-					s.logger.Info(">>> Sending P-frame",
-						"frame", frameCount,
-						"seq", seqNum,
-						"timestamp", timestamp)
-				}
-				seqNum = s.sendNALU(pframe, seqNum, timestamp, payloader, mtu, true)
-			}
-
-			// Increment timestamp (90kHz clock, 33ms = ~3000 ticks)
-			timestamp += 3000
-		}
-	}
-}
-
-// sendNALU sends a single NALU as RTP packets
-func (s *DiagnosticSession) sendNALU(nalu []byte, seqNum uint16, timestamp uint32, payloader *codecs.H264Payloader, mtu int, marker bool) uint16 {
-	payloads := payloader.Payload(uint16(mtu), nalu)
-
-	for i, payload := range payloads {
-		isLast := i == len(payloads)-1
-		packet := &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				PayloadType:    96,
-				SequenceNumber: seqNum,
-				Timestamp:      timestamp,
-				Marker:         marker && isLast,
-			},
-			Payload: payload,
-		}
-
-		if err := s.videoTrack.WriteRTP(packet); err != nil {
-			if err != io.ErrClosedPipe {
-				s.logger.Error(">>> RTP write failed", "error", err, "seq", seqNum)
-			}
-			return seqNum
-		}
-
-		s.rtpSent.Add(1)
-		seqNum++
-	}
-
-	return seqNum
-}
-
-func (s *DiagnosticSession) printSummary() {
-	duration := time.Since(s.startTime)
-
-	separator := strings.Repeat("=", 80)
-	fmt.Println("\n" + separator)
-	fmt.Println("DIAGNOSTIC SUMMARY")
-	fmt.Println(separator)
-	fmt.Printf("Duration:             %s\n", duration.Round(time.Second))
-	fmt.Printf("Session ID:           %s\n", s.sessionID)
-	fmt.Printf("Final State:          %s\n", s.connectionState.Load().(webrtc.PeerConnectionState).String())
-	fmt.Println()
-
-	fmt.Println("RTP PACKETS SENT:")
-	fmt.Printf("  Total:              %d packets\n", s.rtpSent.Load())
-	fmt.Printf("  Rate:               %.1f pps\n", float64(s.rtpSent.Load())/duration.Seconds())
-	fmt.Println()
-
-	fmt.Println("RTCP FEEDBACK RECEIVED:")
-	fmt.Printf("  Total RTCP packets: %d\n", s.rtcpReceived.Load())
-	fmt.Printf("  PLI (keyframe req): %d\n", s.pliReceived.Load())
-	fmt.Printf("  FIR (full refresh): %d\n", s.firReceived.Load())
-	fmt.Printf("  NACK (packet loss): %d\n", s.nackReceived.Load())
-	fmt.Printf("  Receiver Reports:   %d\n", s.receiverReports.Load())
-	fmt.Printf("  Sender Reports:     %d\n", s.senderReports.Load())
-	fmt.Println()
-
-	// Analysis
-	fmt.Println("ANALYSIS:")
-
-	if s.rtpSent.Load() == 0 {
-		fmt.Println("  ❌ CRITICAL: No RTP packets sent - sending goroutine may have exited")
-	} else {
-		fmt.Printf("  ✓ RTP sending appears to be working (%d packets)\n", s.rtpSent.Load())
-	}
-
-	if s.rtcpReceived.Load() == 0 {
-		fmt.Println("  ❌ WARNING: No RTCP feedback received from Cloudflare")
-		fmt.Println("     - This could indicate RTCP read loop not working")
-		fmt.Println("     - Or Cloudflare not sending feedback")
-	} else {
-		fmt.Printf("  ✓ RTCP feedback is being received (%d packets)\n", s.rtcpReceived.Load())
-	}
-
-	if s.pliReceived.Load() > 0 {
-		fmt.Printf("  ⚠️  IMPORTANT: Cloudflare sent %d PLI requests for keyframes\n", s.pliReceived.Load())
-		fmt.Println("     - This means Cloudflare received packets but couldn't decode them")
-		fmt.Println("     - Likely cause: Missing keyframe or SPS/PPS")
-		fmt.Println("     - ACTION: Ensure first frame is complete IDR (SPS+PPS+IDR)")
-	}
-
-	if s.firReceived.Load() > 0 {
-		fmt.Printf("  ⚠️  IMPORTANT: Cloudflare sent %d FIR requests\n", s.firReceived.Load())
-		fmt.Println("     - Similar to PLI - decoder needs full refresh")
-	}
-
-	if s.nackReceived.Load() > 0 {
-		fmt.Printf("  ⚠️  Cloudflare detected packet loss (%d NACKs)\n", s.nackReceived.Load())
-		fmt.Println("     - Network issues or sequence number problems")
-	}
-
-	state := s.connectionState.Load().(webrtc.PeerConnectionState)
-	if state != webrtc.PeerConnectionStateConnected {
-		fmt.Printf("  ❌ Connection not in 'connected' state: %s\n", state.String())
-	}
-
-	fmt.Println(separator)
-
-	// Root cause hypothesis
-	fmt.Println("\nROOT CAUSE HYPOTHESIS:")
-	if s.pliReceived.Load() > 0 {
-		fmt.Println("  → Cloudflare IS receiving RTP packets (hence PLI requests)")
-		fmt.Println("  → But decoder CANNOT decode them (hence PLI)")
-		fmt.Println("  → Most likely: First packet sent was NOT a complete keyframe")
-		fmt.Println("  → Or: SPS/PPS not sent before IDR")
-		fmt.Println("  → ACTION NEEDED: Verify main app sends SPS+PPS+IDR as first frames")
-	} else if s.rtcpReceived.Load() == 0 {
-		fmt.Println("  → No RTCP received - RTCP read loop may not be set up")
-		fmt.Println("  → ACTION NEEDED: Add RTCP reader to main app's bridge.go")
-	} else if s.rtpSent.Load() == 0 {
-		fmt.Println("  → RTP sending goroutine failed - check goroutine lifecycle")
-	} else {
-		fmt.Println("  → Connection and flow appear healthy")
-		fmt.Println("  → If video still black in production, check:")
-		fmt.Println("     1. Is first frame a complete keyframe?")
-		fmt.Println("     2. Are we responding to PLI with keyframes?")
-	}
-
-	fmt.Println()
 }
