@@ -135,6 +135,7 @@ class CameraConnection {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 3000;
+        this.statsInterval = null;
     }
 
     async connect() {
@@ -172,9 +173,11 @@ class CameraConnection {
                 this.updateStatus(this.pc.connectionState);
 
                 if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'disconnected') {
+                    this.stopStatsMonitoring();
                     this.handleDisconnect();
                 } else if (this.pc.connectionState === 'connected') {
                     this.reconnectAttempts = 0; // Reset on successful connection
+                    this.startStatsMonitoring();
                 }
             };
 
@@ -244,6 +247,17 @@ class CameraConnection {
         // Call backend proxy instead of Cloudflare directly
         const url = `/api/cf/sessions/${this.sessionId}/tracks/new`;
 
+        // First, let's check the producer session state
+        try {
+            const debugResp = await fetch(`/api/debug/session?sessionId=${this.cameraData.sessionId}`);
+            if (debugResp.ok) {
+                const debugData = await debugResp.json();
+                console.log(`[Camera ${this.cameraData.id}] Producer session state:`, debugData);
+            }
+        } catch (err) {
+            console.warn(`[Camera ${this.cameraData.id}] Could not fetch producer session state:`, err);
+        }
+
         // Pull video and audio tracks from producer session
         const tracks = this.cameraData.tracks.map(track => ({
             location: 'remote',
@@ -251,7 +265,12 @@ class CameraConnection {
             trackName: track.trackName
         }));
 
-        console.log(`[Camera ${this.cameraData.id}] Pulling tracks:`, { url, tracks });
+        console.log(`[Camera ${this.cameraData.id}] Pulling tracks:`, {
+            url,
+            viewerSessionId: this.sessionId,
+            producerSessionId: this.cameraData.sessionId,
+            tracks
+        });
 
         const response = await fetch(url, {
             method: 'POST',
@@ -347,7 +366,68 @@ class CameraConnection {
         }
     }
 
+    startStatsMonitoring() {
+        // Log stats immediately and then every 2 seconds
+        this.logStats();
+        this.statsInterval = setInterval(() => this.logStats(), 2000);
+    }
+
+    stopStatsMonitoring() {
+        if (this.statsInterval) {
+            clearInterval(this.statsInterval);
+            this.statsInterval = null;
+        }
+    }
+
+    async logStats() {
+        if (!this.pc) return;
+
+        try {
+            const stats = await this.pc.getStats();
+            stats.forEach(report => {
+                if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                    const framesDecoded = report.framesDecoded || 0;
+                    const framesReceived = report.framesReceived || 0;
+                    const framesDropped = report.framesDropped || 0;
+                    const bytesReceived = report.bytesReceived || 0;
+                    const packetsReceived = report.packetsReceived || 0;
+                    const packetsLost = report.packetsLost || 0;
+                    const jitter = report.jitter || 0;
+
+                    console.log(`[Camera ${this.cameraData.id}] WebRTC Stats:`, {
+                        framesDecoded,
+                        framesReceived,
+                        framesDropped,
+                        bytesReceived,
+                        packetsReceived,
+                        packetsLost,
+                        jitter: jitter.toFixed(4)
+                    });
+
+                    // Update tile with stats for visual feedback
+                    if (this.tile) {
+                        this.tile.updateStats({
+                            framesDecoded,
+                            framesReceived,
+                            packetsReceived,
+                            packetsLost
+                        });
+                    }
+
+                    // Diagnostic: if we receive packets but no frames decode, that's the issue
+                    if (packetsReceived > 0 && framesDecoded === 0) {
+                        console.warn(`[Camera ${this.cameraData.id}] WARNING: Packets received (${packetsReceived}) but 0 frames decoded - possible codec/profile mismatch`);
+                    }
+                }
+            });
+        } catch (error) {
+            console.error(`[Camera ${this.cameraData.id}] Error getting stats:`, error);
+        }
+    }
+
     close() {
+        this.stopStatsMonitoring();
+
         if (this.pc) {
             this.pc.close();
             this.pc = null;

@@ -47,6 +47,7 @@ class CameraTile {
         this.videoElement = this.element.querySelector('video');
         this.statusElement = this.element.querySelector('.camera-status');
         this.errorElement = this.element.querySelector('.error-message');
+        this.statsElement = this.element.querySelector('.camera-stats');
     }
 
     createTileElement() {
@@ -68,6 +69,10 @@ class CameraTile {
                     <span>Camera ID:</span>
                     <span>${this.escapeHtml(this.cameraId)}</span>
                 </div>
+            </div>
+            <div class="camera-stats" style="font-size: 10px; padding: 4px 8px; background: rgba(0,0,0,0.5); color: #ccc;">
+                <span class="stats-frames">Frames: 0/0</span> |
+                <span class="stats-packets">Pkts: 0 (lost: 0)</span>
             </div>
             <div class="error-message" style="display: none;"></div>
         `;
