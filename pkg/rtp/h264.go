@@ -25,7 +25,7 @@ type H264Processor struct {
 	buffer   []byte // Buffer for accumulating fragmented NALUs
 	sps      []byte
 	pps      []byte
-	OnFrame  func(nalus []byte, keyframe bool) // Called when a complete frame is ready
+	OnFrame  func(nalus []byte, timestamp uint32, keyframe bool) // Called when a complete frame is ready
 }
 
 // NewH264Processor creates a new H.264 RTP processor
@@ -86,8 +86,8 @@ func (p *H264Processor) processFUA(packet *rtp.Packet) error {
 	p.buffer = append(p.buffer, payload...)
 
 	if end {
-		// End of fragmented NALU - emit complete NALU
-		return p.emitNALU(p.buffer, naluType, packet.Marker)
+		// End of fragmented NALU - emit complete NALU with original timestamp
+		return p.emitNALU(p.buffer, naluType, packet.Timestamp, packet.Marker)
 	}
 
 	return nil
@@ -126,7 +126,7 @@ func (p *H264Processor) processSTAPA(packet *rtp.Packet) error {
 	}
 
 	if len(nalus) > 0 && p.OnFrame != nil {
-		p.OnFrame(nalus, false)
+		p.OnFrame(nalus, packet.Timestamp, false)
 	}
 
 	return nil
@@ -137,11 +137,11 @@ func (p *H264Processor) processSingleNALU(packet *rtp.Packet) error {
 	nalu := packet.Payload
 	naluType := nalu[0] & 0x1F
 
-	return p.emitNALU(nalu, naluType, packet.Marker)
+	return p.emitNALU(nalu, naluType, packet.Timestamp, packet.Marker)
 }
 
-// emitNALU emits a complete NALU
-func (p *H264Processor) emitNALU(nalu []byte, naluType uint8, marker bool) error {
+// emitNALU emits a complete NALU with timestamp
+func (p *H264Processor) emitNALU(nalu []byte, naluType uint8, timestamp uint32, marker bool) error {
 	// Store SPS/PPS for later
 	if naluType == NALUTypeSPS {
 		p.sps = make([]byte, len(nalu))
@@ -166,7 +166,7 @@ func (p *H264Processor) emitNALU(nalu []byte, naluType uint8, marker bool) error
 	}
 
 	if p.OnFrame != nil && marker {
-		p.OnFrame(frame, isKeyframe)
+		p.OnFrame(frame, timestamp, isKeyframe)
 	}
 
 	return nil

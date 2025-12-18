@@ -29,14 +29,24 @@ type Bridge struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 
+	// Leaky bucket pacer (Section 8.2 from report)
+	pacer *Pacer
+
 	// H.264 RTP packetization
 	h264Payloader *codecs.H264Payloader
 	videoSeqNum   uint16
-	videoTS       uint32
-	videoMu       sync.Mutex // Protects sequence number and timestamp
+	videoMu       sync.Mutex // Protects sequence number
+
+	// Audio RTP packetization
+	audioSeqNum uint16
+	audioMu     sync.Mutex // Protects audio sequence number
+
+	// Timestamp validation and diagnostics
+	lastVideoTS uint32
+	tsWarnCount uint32
 
 	// Cached connection state (to avoid blocking on pc.ConnectionState())
-	connStateMu    sync.RWMutex
+	connStateMu     sync.RWMutex
 	cachedConnState webrtc.PeerConnectionState
 }
 
@@ -53,6 +63,9 @@ func NewBridge(ctx context.Context, cfClient *cloudflare.Client, logger *slog.Lo
 		videoSeqNum:     uint16(time.Now().UnixNano() & 0xFFFF), // Random starting sequence number
 		cachedConnState: webrtc.PeerConnectionStateNew,          // Initial state
 	}
+
+	// Create pacer for smooth packet transmission (report Section 8.2)
+	b.pacer = NewPacer(ctx, logger)
 
 	return b, nil
 }
@@ -256,6 +269,15 @@ func (b *Bridge) Negotiate(ctx context.Context) error {
 		"session_id", b.sessionID,
 		"tracks", len(tracksResp.Tracks))
 
+	// Start pacer now that WebRTC session is established
+	// Configure pacer callbacks to write to our tracks
+	b.pacer.SetWriteCallbacks(
+		b.writeVideoSampleDirect,   // Video write function
+		b.writeAudioSampleDirect,   // Audio write function
+	)
+	b.pacer.Start()
+	b.logger.Info("pacer started - TCP bursts will be smoothed")
+
 	return nil
 }
 
@@ -277,13 +299,61 @@ func (b *Bridge) WriteVideoRTP(packet *rtp.Packet) error {
 
 // WriteVideoSample writes H.264 video data as a sample with proper RTP packetization
 // The input data is expected to be in AVC format (4-byte length prefix per NAL unit)
-func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
+// sourceTimestamp is the original RTP timestamp from the RTSP source (90kHz clock)
+//
+// NEW: This now enqueues to the pacer instead of writing directly (Section 8.2)
+func (b *Bridge) WriteVideoSample(data []byte, sourceTimestamp uint32) error {
 	if b.videoTrack == nil {
 		return fmt.Errorf("video track not initialized")
 	}
 
 	b.videoMu.Lock()
 	defer b.videoMu.Unlock()
+
+	// Timestamp validation and diagnostics
+	if b.lastVideoTS > 0 {
+		// Detect timestamp going backwards (smoking gun for boomerang issue)
+		if sourceTimestamp < b.lastVideoTS {
+			b.tsWarnCount++
+			b.logger.Warn("TIMESTAMP WENT BACKWARDS - BOOMERANG DETECTED",
+				"last_ts", b.lastVideoTS,
+				"current_ts", sourceTimestamp,
+				"delta", int64(sourceTimestamp)-int64(b.lastVideoTS),
+				"occurrence_count", b.tsWarnCount)
+		}
+
+		// Detect large timestamp gaps (potential issue)
+		delta := sourceTimestamp - b.lastVideoTS
+		expectedDelta := uint32(90000 / 30) // ~3000 for 30fps
+		if delta > expectedDelta*3 {        // More than 3x expected
+			b.logger.Warn("large timestamp gap detected",
+				"delta", delta,
+				"expected", expectedDelta,
+				"delta_ms", delta/90)
+		}
+	}
+
+	b.lastVideoTS = sourceTimestamp
+
+	// Enqueue to pacer for smooth transmission (prevents TCP burst forwarding)
+	// The pacer will calculate delays based on RTP timestamp deltas
+	packet := &PacedPacket{
+		Timestamp:  sourceTimestamp,
+		NALUs:      data, // Keep in AVC format for now
+		TrackType:  "video",
+		ReceivedAt: time.Now(),
+	}
+
+	return b.pacer.EnqueueVideo(packet)
+}
+
+// writeVideoSampleDirect is the actual write function called by the pacer
+// This performs the packetization and WriteRTP after pacing delay
+// Note: Mutex must NOT be locked here as this is called from pacer goroutine
+func (b *Bridge) writeVideoSampleDirect(data []byte, sourceTimestamp uint32) error {
+	if b.videoTrack == nil {
+		return fmt.Errorf("video track not initialized")
+	}
 
 	// Extract NAL units from AVC format (4-byte length prefix per NALU)
 	// The H264Payloader expects raw NAL units without length prefixes
@@ -292,9 +362,13 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 		return fmt.Errorf("extract NAL units: %w", err)
 	}
 
-	// Get current timestamp and sequence number
-	timestamp := b.videoTS
+	// Lock only for sequence number access (minimize lock contention)
+	b.videoMu.Lock()
 	seqNum := b.videoSeqNum
+	b.videoMu.Unlock()
+
+	// Use source timestamp from RTSP (passthrough - DO NOT synthesize)
+	timestamp := sourceTimestamp
 
 	// Packetize and send each NAL unit
 	const mtu = 1200 // Safe MTU for WebRTC
@@ -310,7 +384,7 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 					Version:        2,
 					PayloadType:    96, // H.264 payload type
 					SequenceNumber: seqNum,
-					Timestamp:      timestamp,
+					Timestamp:      timestamp, // PASSTHROUGH from source
 					// Mark last packet of last NAL unit in frame
 					Marker: (naluIdx == len(nalus)-1) && (i == len(payloads)-1),
 				},
@@ -327,6 +401,7 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 					"total_nalus", len(nalus),
 					"packet_num", i+1,
 					"total_packets", len(payloads),
+					"timestamp", timestamp,
 					"connection_state", b.GetConnectionState().String(),
 					"error", err)
 				return fmt.Errorf("write RTP packet NALU %d/%d pkt %d/%d (state=%s): %w",
@@ -338,13 +413,10 @@ func (b *Bridge) WriteVideoSample(data []byte, duration time.Duration) error {
 		}
 	}
 
-	// Update sequence number and timestamp for next sample
+	// Update sequence number
+	b.videoMu.Lock()
 	b.videoSeqNum = seqNum
-
-	// Increment timestamp based on duration (90kHz clock for H.264)
-	// duration is in nanoseconds, convert to 90kHz ticks
-	timestampIncrement := uint32(duration.Nanoseconds() * 90000 / 1e9)
-	b.videoTS += timestampIncrement
+	b.videoMu.Unlock()
 
 	return nil
 }
@@ -397,22 +469,47 @@ func (b *Bridge) WriteAudioRTP(packet *rtp.Packet) error {
 	return nil
 }
 
-// WriteAudioSample writes audio data as a sample
-func (b *Bridge) WriteAudioSample(data []byte, duration time.Duration) error {
+// WriteAudioSample writes audio data as a sample with source timestamp
+// sourceTimestamp is the original RTP timestamp from the RTSP source (48kHz clock for AAC)
+//
+// NEW: This now enqueues to the pacer instead of writing directly (Section 8.2)
+func (b *Bridge) WriteAudioSample(data []byte, sourceTimestamp uint32) error {
 	if b.audioTrack == nil {
 		return fmt.Errorf("audio track not initialized")
 	}
+
+	// Enqueue to pacer for smooth transmission
+	packet := &PacedPacket{
+		Timestamp:  sourceTimestamp,
+		NALUs:      data,
+		TrackType:  "audio",
+		ReceivedAt: time.Now(),
+	}
+
+	return b.pacer.EnqueueAudio(packet)
+}
+
+// writeAudioSampleDirect is the actual write function called by the pacer
+func (b *Bridge) writeAudioSampleDirect(data []byte, sourceTimestamp uint32) error {
+	if b.audioTrack == nil {
+		return fmt.Errorf("audio track not initialized")
+	}
+
+	b.audioMu.Lock()
+	defer b.audioMu.Unlock()
 
 	// For StaticRTP, we need to packetize ourselves
 	packet := &rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			PayloadType:    111,
-			SequenceNumber: uint16(time.Now().UnixNano() & 0xFFFF),
-			Timestamp:      uint32(time.Now().UnixNano() / 1000000),
+			SequenceNumber: b.audioSeqNum,
+			Timestamp:      sourceTimestamp, // PASSTHROUGH from source (48kHz clock)
 		},
 		Payload: data,
 	}
+
+	b.audioSeqNum++
 
 	return b.WriteAudioRTP(packet)
 }
@@ -510,6 +607,11 @@ func (b *Bridge) readRTCP(sender *webrtc.RTPSender, trackType string) {
 // Close closes the bridge and all resources
 func (b *Bridge) Close() error {
 	b.logger.Info("closing bridge")
+
+	// Stop pacer first to drain queued packets
+	if b.pacer != nil {
+		b.pacer.Stop()
+	}
 
 	b.cancel()
 	b.wg.Wait()

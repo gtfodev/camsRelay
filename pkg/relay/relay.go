@@ -119,14 +119,15 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 	r.aacProc = rtp.NewAACProcessor()
 
 	// Setup H.264 frame handler
-	r.h264Proc.OnFrame = func(nalus []byte, keyframe bool) {
+	r.h264Proc.OnFrame = func(nalus []byte, timestamp uint32, keyframe bool) {
 		r.videoFrameCount.Add(1)
 		frameCount := r.videoFrameCount.Load()
 
-		// Write to WebRTC bridge with fixed 33ms duration (30fps)
-		if err := r.webrtcBridge.WriteVideoSample(nalus, 33*time.Millisecond); err != nil {
+		// Write to WebRTC bridge with original RTSP timestamp (passthrough)
+		if err := r.webrtcBridge.WriteVideoSample(nalus, timestamp); err != nil {
 			r.logger.Error("failed to write video sample",
 				"frame_count", frameCount,
+				"timestamp", timestamp,
 				"keyframe", keyframe,
 				"connection_state", r.webrtcBridge.GetConnectionState().String(),
 				"error", err)
@@ -137,11 +138,13 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 		if frameCount == 1 {
 			r.logger.Info("first video frame written successfully",
 				"keyframe", keyframe,
+				"timestamp", timestamp,
 				"size_bytes", len(nalus),
 				"connection_state", r.webrtcBridge.GetConnectionState().String())
 		} else if frameCount%300 == 0 { // Log every 10 seconds @ 30fps
 			r.logger.Info("video frames written",
 				"frame_count", frameCount,
+				"timestamp", timestamp,
 				"keyframe", keyframe,
 				"size_bytes", len(nalus),
 				"connection_state", r.webrtcBridge.GetConnectionState().String())
@@ -149,10 +152,11 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 	}
 
 	// Setup AAC frame handler (audio not transcoded yet)
-	r.aacProc.OnFrame = func(frame []byte) {
+	r.aacProc.OnFrame = func(frame []byte, timestamp uint32) {
 		r.audioFrameCount.Add(1)
 		// TODO: Transcode AAC to Opus for Cloudflare
 		// For now, we just count the frames
+		// When audio is enabled, call: r.webrtcBridge.WriteAudioSample(frame, timestamp)
 	}
 
 	// Setup RTP packet handler

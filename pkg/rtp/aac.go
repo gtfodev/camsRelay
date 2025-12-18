@@ -15,7 +15,7 @@ const (
 
 // AACProcessor handles AAC RTP depacketization
 type AACProcessor struct {
-	OnFrame func(frame []byte) // Called when a complete AAC frame is ready
+	OnFrame func(frame []byte, timestamp uint32) // Called when a complete AAC frame is ready
 }
 
 // NewAACProcessor creates a new AAC RTP processor
@@ -58,9 +58,9 @@ func (p *AACProcessor) ProcessPacket(packet *rtp.Packet) error {
 		frame := auData[offset : offset+auSize]
 		offset += auSize
 
-		// Emit frame
+		// Emit frame with timestamp
 		if p.OnFrame != nil && len(frame) > 0 {
-			p.OnFrame(frame)
+			p.OnFrame(frame, packet.Timestamp)
 		}
 
 		// Move to next AU header (2 bytes per header)
