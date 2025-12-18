@@ -28,6 +28,17 @@ type Server struct {
 	httpServer  *http.Server
 	mu          sync.RWMutex
 	cameraNames map[string]string // cameraID -> display name
+
+	// Viewer session management for reuse across refreshes
+	viewerMu       sync.RWMutex
+	viewerSessions map[string]*viewerSession // viewerId -> session info
+}
+
+// viewerSession tracks a viewer's Cloudflare session for reuse
+type viewerSession struct {
+	sessionID string
+	createdAt time.Time
+	lastUsed  time.Time
 }
 
 // CameraInfo represents a camera's session information for the viewer
@@ -44,6 +55,17 @@ type ConfigResponse struct {
 	AppID string `json:"appId"`
 }
 
+// FindViewerSessionRequest requests a session for a specific viewer identity
+type FindViewerSessionRequest struct {
+	ViewerID string `json:"viewerId"`
+}
+
+// FindViewerSessionResponse returns a session ID and whether it was reused
+type FindViewerSessionResponse struct {
+	SessionID  string `json:"sessionId"`
+	IsExisting bool   `json:"isExisting"`
+}
+
 // NewServer creates a new API server
 func NewServer(
 	relay *relay.MultiCameraRelay,
@@ -52,11 +74,12 @@ func NewServer(
 	logger *slog.Logger,
 ) *Server {
 	return &Server{
-		relay:       relay,
-		cfClient:    cfClient,
-		appID:       appID,
-		logger:      logger,
-		cameraNames: make(map[string]string),
+		relay:          relay,
+		cfClient:       cfClient,
+		appID:          appID,
+		logger:         logger,
+		cameraNames:    make(map[string]string),
+		viewerSessions: make(map[string]*viewerSession),
 	}
 }
 
@@ -75,6 +98,9 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	mux.HandleFunc("/api/cameras", s.handleGetCameras)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/debug/session", s.handleDebugSession)
+
+	// Viewer session management
+	mux.HandleFunc("/api/viewer/session", s.handleViewerSession)
 
 	// Cloudflare proxy endpoints (authenticated on backend)
 	mux.HandleFunc("/api/cf/sessions/new", s.handleCreateSession)
@@ -101,6 +127,9 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	}
 
 	s.logger.Info("starting HTTP server", "address", addr)
+
+	// Start viewer session cleanup goroutine
+	s.startViewerCleanup(ctx)
 
 	// Start server in goroutine
 	errChan := make(chan error, 1)
@@ -529,4 +558,131 @@ func (s *Server) handleRenegotiate(w http.ResponseWriter, r *http.Request, sessi
 	// Return response to frontend
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleViewerSession finds or creates a session for a viewer identity
+func (s *Server) handleViewerSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req FindViewerSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.ViewerID == "" {
+		http.Error(w, "viewerId required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Check for existing session
+	s.viewerMu.RLock()
+	existing, exists := s.viewerSessions[req.ViewerID]
+	s.viewerMu.RUnlock()
+
+	if exists {
+		// Validate session still exists in Cloudflare
+		if s.isViewerSessionValid(ctx, existing.sessionID) {
+			// Update last used time
+			s.viewerMu.Lock()
+			existing.lastUsed = time.Now()
+			s.viewerMu.Unlock()
+
+			s.logger.Info("reusing viewer session",
+				"viewer_id", req.ViewerID,
+				"session_id", existing.sessionID,
+				"age", time.Since(existing.createdAt).Round(time.Second))
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(FindViewerSessionResponse{
+				SessionID:  existing.sessionID,
+				IsExisting: true,
+			})
+			return
+		}
+
+		// Session invalid, remove from map
+		s.viewerMu.Lock()
+		delete(s.viewerSessions, req.ViewerID)
+		s.viewerMu.Unlock()
+		s.logger.Info("viewer session expired, creating new",
+			"viewer_id", req.ViewerID,
+			"old_session_id", existing.sessionID)
+	}
+
+	// Create new session
+	resp, err := s.cfClient.CreateSession(ctx)
+	if err != nil {
+		s.logger.Error("failed to create viewer session",
+			"viewer_id", req.ViewerID,
+			"error", err)
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	// Store mapping
+	s.viewerMu.Lock()
+	s.viewerSessions[req.ViewerID] = &viewerSession{
+		sessionID: resp.SessionID,
+		createdAt: time.Now(),
+		lastUsed:  time.Now(),
+	}
+	s.viewerMu.Unlock()
+
+	s.logger.Info("created new viewer session",
+		"viewer_id", req.ViewerID,
+		"session_id", resp.SessionID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(FindViewerSessionResponse{
+		SessionID:  resp.SessionID,
+		IsExisting: false,
+	})
+}
+
+// isViewerSessionValid checks if a session still exists in Cloudflare
+func (s *Server) isViewerSessionValid(ctx context.Context, sessionID string) bool {
+	_, err := s.cfClient.GetSessionState(ctx, sessionID)
+	return err == nil
+}
+
+// startViewerCleanup starts a background goroutine to clean up stale viewer sessions
+func (s *Server) startViewerCleanup(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				s.logger.Info("stopping viewer session cleanup")
+				return
+			case <-ticker.C:
+				s.cleanupStaleViewerSessions()
+			}
+		}
+	}()
+}
+
+// cleanupStaleViewerSessions removes sessions that haven't been used in 30 minutes
+func (s *Server) cleanupStaleViewerSessions() {
+	s.viewerMu.Lock()
+	defer s.viewerMu.Unlock()
+
+	threshold := time.Now().Add(-30 * time.Minute)
+	cleaned := 0
+	for viewerID, session := range s.viewerSessions {
+		if session.lastUsed.Before(threshold) {
+			delete(s.viewerSessions, viewerID)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		s.logger.Info("cleaned up stale viewer sessions", "count", cleaned)
+	}
 }
