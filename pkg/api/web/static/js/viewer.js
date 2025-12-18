@@ -208,6 +208,7 @@ export class Viewer {
                     trackName: track.trackName
                 });
                 // Map trackName to cameraId for ontrack routing
+                // Track names are now unique: "${cameraId}-video" or "${cameraId}-audio"
                 this.pendingTracks.set(track.trackName, camera.id);
             }
         }
@@ -239,15 +240,48 @@ export class Viewer {
 
         const data = await response.json();
 
+        // Track success/failure counts for reporting
+        let successCount = 0;
+        let failureCount = 0;
+        const failedCameras = [];
+
         // Map mids to cameras for ontrack routing
         if (data.tracks) {
             for (const track of data.tracks) {
+                // Check for errors (e.g., relay not connected yet)
+                if (track.errorCode) {
+                    failureCount++;
+                    const cameraId = this.pendingTracks.get(track.trackName);
+                    if (cameraId) {
+                        failedCameras.push({
+                            cameraId,
+                            trackName: track.trackName,
+                            error: track.errorDescription || track.errorCode
+                        });
+                    }
+                    console.warn('[Viewer] Track failed:',
+                        'trackName:', track.trackName,
+                        'error:', track.errorCode,
+                        'description:', track.errorDescription);
+                    continue;
+                }
+
+                // Map successful track
                 const cameraId = this.pendingTracks.get(track.trackName);
-                if (cameraId && track.mid) {
+                if (cameraId && track.mid !== undefined) {
                     this.trackMids.set(cameraId, track.mid);
+                    successCount++;
                     console.log('[Viewer] Mapped camera', cameraId, 'to mid', track.mid);
                 }
             }
+        }
+
+        console.log(`[Viewer] Track pull results: ${successCount} success, ${failureCount} failed`);
+
+        // If some tracks failed, log which cameras need retry
+        if (failedCameras.length > 0) {
+            console.warn('[Viewer] Failed cameras (may retry on next refresh):',
+                failedCameras.map(f => f.cameraId));
         }
 
         // Handle SDP negotiation

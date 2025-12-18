@@ -169,8 +169,8 @@ func main() {
 		}
 	}()
 
-	// Create WebRTC bridge to Cloudflare
-	webrtcBridge, err := bridge.NewBridge(ctx, cfClient, log.With("component", "bridge").Logger)
+	// Create WebRTC bridge to Cloudflare with camera ID for unique track naming
+	webrtcBridge, err := bridge.NewBridge(ctx, firstCamera.DeviceID, cfClient, log.With("component", "bridge").Logger)
 	if err != nil {
 		log.Error("failed to create bridge", "error", err)
 		os.Exit(1)

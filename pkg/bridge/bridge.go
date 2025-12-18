@@ -19,6 +19,7 @@ import (
 type Bridge struct {
 	logger      *slog.Logger
 	cfClient    *cloudflare.Client
+	cameraID    string // Unique camera identifier for track naming
 	sessionID   string
 	pc          *webrtc.PeerConnection
 	videoTrack  *webrtc.TrackLocalStaticRTP
@@ -51,12 +52,13 @@ type Bridge struct {
 }
 
 // NewBridge creates a new WebRTC bridge to Cloudflare
-func NewBridge(ctx context.Context, cfClient *cloudflare.Client, logger *slog.Logger) (*Bridge, error) {
+func NewBridge(ctx context.Context, cameraID string, cfClient *cloudflare.Client, logger *slog.Logger) (*Bridge, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	b := &Bridge{
 		logger:          logger,
 		cfClient:        cfClient,
+		cameraID:        cameraID,
 		ctx:             ctx,
 		cancel:          cancel,
 		h264Payloader:   &codecs.H264Payloader{},
@@ -134,13 +136,15 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 		b.logger.Info("peer connection state changed", "state", state.String())
 	})
 
-	// Create video track
+	// Create video track with unique name based on camera ID
+	// This ensures viewer can map tracks back to cameras correctly
+	videoTrackName := fmt.Sprintf("%s-video", b.cameraID)
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{
 			MimeType:  webrtc.MimeTypeH264,
 			ClockRate: 90000,
 		},
-		"video",
+		videoTrackName,
 		"nest-camera-video",
 	)
 	if err != nil {
@@ -154,14 +158,15 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 	}
 	b.videoSender = videoSender
 
-	// Create audio track
+	// Create audio track with unique name based on camera ID
+	audioTrackName := fmt.Sprintf("%s-audio", b.cameraID)
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{
 			MimeType:  webrtc.MimeTypeOpus,
 			ClockRate: 48000,
 			Channels:  2,
 		},
-		"audio",
+		audioTrackName,
 		"nest-camera-audio",
 	)
 	if err != nil {
@@ -227,6 +232,7 @@ func (b *Bridge) Negotiate(ctx context.Context) error {
 	b.logger.Info("transceivers ready", "video_mid", videoMid, "audio_mid", audioMid)
 
 	// Send offer to Cloudflare via AddTracks
+	// Use unique track names so viewer can map tracks back to cameras
 	tracksReq := &cloudflare.TracksRequest{
 		SessionDescription: &cloudflare.SessionDescription{
 			SDP:  localSDP,
@@ -236,12 +242,12 @@ func (b *Bridge) Negotiate(ctx context.Context) error {
 			{
 				Location:  "local",
 				Mid:       videoMid,
-				TrackName: "video",
+				TrackName: fmt.Sprintf("%s-video", b.cameraID),
 			},
 			{
 				Location:  "local",
 				Mid:       audioMid,
-				TrackName: "audio",
+				TrackName: fmt.Sprintf("%s-audio", b.cameraID),
 			},
 		},
 	}

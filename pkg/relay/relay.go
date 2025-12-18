@@ -76,9 +76,9 @@ func (r *CameraRelay) Start(ctx context.Context) error {
 		"stream_url", r.stream.URL,
 		"expires_at", r.stream.ExpiresAt.Format(time.RFC3339))
 
-	// Create WebRTC bridge to Cloudflare
+	// Create WebRTC bridge to Cloudflare with unique camera ID for track naming
 	var err error
-	r.webrtcBridge, err = bridge.NewBridge(r.ctx, r.cfClient, r.logger.With("component", "bridge"))
+	r.webrtcBridge, err = bridge.NewBridge(r.ctx, r.cameraID, r.cfClient, r.logger.With("component", "bridge"))
 	if err != nil {
 		return fmt.Errorf("create bridge: %w", err)
 	}
