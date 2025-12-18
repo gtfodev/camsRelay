@@ -31,7 +31,7 @@ echo -e "${YELLOW}Camera Host:${NC} ${CAMERA_HOST}"
 echo ""
 
 # Check we're in correct directory
-if [ ! -f "cmd/relay/main.go" ]; then
+if [ ! -f "cmd/dev-relay/main.go" ]; then
     echo -e "${RED}ERROR: Must run from /home/ethan/cams directory${NC}"
     exit 1
 fi
@@ -71,16 +71,16 @@ echo ""
 
 # Phase 3: Capture our Go client's conversation
 echo -e "${GREEN}=== Phase 3: Capturing Go client RTSP conversation ===${NC}"
-echo "Building relay..."
-go build -o bin/relay cmd/relay/main.go
+echo "Building dev-relay..."
+go build -o bin/dev-relay cmd/dev-relay/main.go
 
 echo "Starting tcpdump..."
 sudo tcpdump -i ${INTERFACE} -w /tmp/relay_rtsp.pcap "host ${CAMERA_HOST}" &
 TCPDUMP_PID=$!
 sleep 2
 
-echo "Running relay for 10 seconds..."
-timeout 10 ./bin/relay 2>&1 | tee /tmp/relay_debug.log || true
+echo "Running dev-relay for 10 seconds..."
+timeout 10 ./bin/dev-relay 2>&1 | tee /tmp/relay_debug.log || true
 
 # Stop tcpdump
 sudo kill ${TCPDUMP_PID} 2>/dev/null || true

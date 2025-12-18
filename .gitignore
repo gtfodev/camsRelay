@@ -1,9 +1,9 @@
 # Binaries (executables only, not directories)
 /relay
-/multi-relay
+/dev-relay
 /cmd/relay/relay
+/cmd/dev-relay/dev-relay
 /cmd/verify/verify
-/cmd/multi-relay/multi-relay
 *.exe
 *.dll
 *.so

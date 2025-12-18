@@ -4,11 +4,11 @@
 set -e
 
 PROJECT_ROOT="/home/ethan/cams"
-BINARY="$PROJECT_ROOT/multi-relay"
+BINARY="$PROJECT_ROOT/relay"
 
-echo "Building multi-relay with embedded assets..."
+echo "Building relay with embedded assets..."
 cd "$PROJECT_ROOT"
-go build -o "$BINARY" ./cmd/multi-relay
+go build -o "$BINARY" ./cmd/relay
 
 echo "Binary size:"
 ls -lh "$BINARY"
@@ -23,4 +23,4 @@ echo "  2. $BINARY &"
 echo "  3. curl http://localhost:8080/"
 echo "  4. curl http://localhost:8080/static/js/viewer.js"
 
-rm -f /tmp/test-multi-relay
+rm -f /tmp/test-relay

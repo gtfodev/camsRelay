@@ -56,13 +56,13 @@ echo ""
 echo -e "${GREEN}=== Test 2: Go Client Socket Monitoring ===${NC}"
 
 # Build if needed
-if [ ! -f "bin/relay" ]; then
-    echo "Building relay..."
-    go build -o bin/relay cmd/relay/main.go
+if [ ! -f "bin/dev-relay" ]; then
+    echo "Building dev-relay..."
+    go build -o bin/dev-relay cmd/dev-relay/main.go
 fi
 
-# Start relay in background
-timeout 5 ./bin/relay &
+# Start dev-relay in background
+timeout 5 ./bin/dev-relay &
 RELAY_PID=$!
 sleep 2
 
@@ -82,7 +82,7 @@ timeout 3 strace -e setsockopt ffmpeg -rtsp_transport tcp -i "${RTSP_URL}" -f nu
 echo ""
 
 echo -e "${YELLOW}Go client setsockopt calls:${NC}"
-timeout 3 strace -e setsockopt ./bin/relay 2>&1 | \
+timeout 3 strace -e setsockopt ./bin/dev-relay 2>&1 | \
     grep setsockopt | head -20 || echo "No setsockopt calls found"
 echo ""
 

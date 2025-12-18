@@ -4,15 +4,15 @@
 set -e
 
 PROJECT_ROOT="/home/ethan/cams"
-BINARY="$PROJECT_ROOT/multi-relay"
+BINARY="$PROJECT_ROOT/relay"
 
 echo "=== Embedded Assets Verification ==="
 echo ""
 
 # Build binary
-echo "1. Building multi-relay binary..."
+echo "1. Building relay binary..."
 cd "$PROJECT_ROOT"
-go build -o "$BINARY" ./cmd/multi-relay 2>&1 | grep -v "^#" || true
+go build -o "$BINARY" ./cmd/relay 2>&1 | grep -v "^#" || true
 
 # Check binary size
 echo ""

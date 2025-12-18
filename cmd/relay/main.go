@@ -2,101 +2,69 @@ package main
 
 import (
 	"context"
-	"flag"
-	"fmt"
+	"log"
+	"log/slog"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/ethan/nest-cloudflare-relay/pkg/bridge"
+	"github.com/ethan/nest-cloudflare-relay/pkg/api"
 	"github.com/ethan/nest-cloudflare-relay/pkg/cloudflare"
 	"github.com/ethan/nest-cloudflare-relay/pkg/config"
-	"github.com/ethan/nest-cloudflare-relay/pkg/logger"
 	"github.com/ethan/nest-cloudflare-relay/pkg/nest"
-	"github.com/ethan/nest-cloudflare-relay/pkg/rtp"
-	rtspClient "github.com/ethan/nest-cloudflare-relay/pkg/rtsp"
-	pionRTP "github.com/pion/rtp"
+	"github.com/ethan/nest-cloudflare-relay/pkg/relay"
 )
 
+// Multi-camera relay example: Full pipeline for multiple cameras
+// Nest cameras → RTSP streams → RTP processing → WebRTC → Cloudflare
 func main() {
-	// Parse command-line flags
-	fs := flag.NewFlagSet("relay", flag.ExitOnError)
-	logFlags := logger.RegisterFlags(fs)
+	// Initialize logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Nest Camera → Cloudflare SFU relay\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		fs.PrintDefaults()
-		logger.PrintUsageExamples()
-	}
+	logger.Info("starting multi-camera Nest → Cloudflare relay")
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Initialize logger from flags
-	logConfig, err := logFlags.ToConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error configuring logger: %v\n", err)
-		os.Exit(1)
-	}
-
-	log, err := logger.New(logConfig)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating logger: %v\n", err)
-		os.Exit(1)
-	}
-	defer log.Close()
-
-	logger.SetDefault(log)
-
-	log.Info("starting Nest Camera → Cloudflare SFU relay - Phase 2",
-		"log_config", logFlags.String())
-
-	// Load configuration
+	// Load credentials from .env file
 	cfg, err := config.Load(".env")
 	if err != nil {
-		log.Error("failed to load configuration", "error", err)
-		os.Exit(1)
+		log.Fatalf("Failed to load config: %v", err)
 	}
-	log.Info("configuration loaded")
 
-	// Create context with cancellation for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Setup signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigChan
-		log.Info("received shutdown signal", "signal", sig)
-		cancel()
-	}()
-
-	// Initialize Nest client
+	// Create Nest API client
 	nestClient := nest.NewClient(
 		cfg.Google.ClientID,
 		cfg.Google.ClientSecret,
 		cfg.Google.RefreshToken,
-		log.With("component", "nest").Logger,
+		logger.With("component", "nest"),
 	)
-	log.Info("Nest client initialized")
+
+	// Create Cloudflare client
+	cfClient := cloudflare.NewClient(
+		cfg.Cloudflare.AppID,
+		cfg.Cloudflare.APIToken,
+		logger.With("component", "cloudflare"),
+	)
 
 	// List available cameras
+	ctx := context.Background()
 	devices, err := nestClient.ListDevices(ctx, cfg.Google.ProjectID)
 	if err != nil {
-		log.Error("failed to list devices", "error", err)
-		os.Exit(1)
+		log.Fatalf("Failed to list devices: %v", err)
 	}
 
-	log.Info("cameras discovered", "count", len(devices))
+	logger.Info("discovered cameras", "count", len(devices))
+
+	// Extract camera IDs (limit to first 20 for rate limiting)
+	cameraIDs := make([]string, 0, 20)
+	cameraNames := make(map[string]string) // Map device ID to display name
 	for i, device := range devices {
+		if i >= 20 {
+			break
+		}
+		cameraIDs = append(cameraIDs, device.DeviceID)
+
 		displayName := device.Traits.Info.CustomName
 		if displayName == "" && len(device.Relations) > 0 {
 			displayName = device.Relations[0].DisplayName
@@ -104,219 +72,228 @@ func main() {
 		if displayName == "" {
 			displayName = device.DeviceID
 		}
+		cameraNames[device.DeviceID] = displayName
 
-		log.Info("camera",
+		logger.Info("camera available",
 			"index", i+1,
-			"name", displayName,
 			"device_id", device.DeviceID,
+			"name", displayName,
 			"protocols", device.Traits.CameraLiveStream.SupportedProtocols,
 			"video_codecs", device.Traits.CameraLiveStream.VideoCodecs,
 			"audio_codecs", device.Traits.CameraLiveStream.AudioCodecs,
 		)
 	}
 
-	if len(devices) == 0 {
-		log.Warn("no cameras found")
-		os.Exit(0)
+	if len(cameraIDs) == 0 {
+		log.Fatal("No cameras found")
 	}
 
-	// Initialize Cloudflare client
-	cfClient := cloudflare.NewClient(
-		cfg.Cloudflare.AppID,
-		cfg.Cloudflare.APIToken,
-		log.With("component", "cloudflare").Logger,
-	)
-	log.Info("Cloudflare client initialized")
+	// Configure multi-stream manager with defaults for 20 cameras @ 10 QPM
+	msmConfig := nest.DefaultMultiStreamConfig()
 
-	// Select first camera for proof of concept
-	firstCamera := devices[0]
-	displayName := firstCamera.Traits.Info.CustomName
-	if displayName == "" && len(firstCamera.Relations) > 0 {
-		displayName = firstCamera.Relations[0].DisplayName
-	}
-	if displayName == "" {
-		displayName = firstCamera.DeviceID
-	}
-
-	log.Info("starting stream for camera",
-		"name", displayName,
-		"device_id", firstCamera.DeviceID)
-
-	// Generate RTSP stream
-	stream, err := nestClient.GenerateRTSPStream(ctx, cfg.Google.ProjectID, firstCamera.DeviceID)
-	if err != nil {
-		log.Error("failed to generate RTSP stream", "error", err)
-		os.Exit(1)
-	}
-
-	log.Info("RTSP stream generated",
-		"url", stream.URL,
-		"expires_at", stream.ExpiresAt.Format(time.RFC3339),
-		"ttl_seconds", int(time.Until(stream.ExpiresAt).Seconds()))
-
-	// Start stream manager for automatic extension
-	streamMgr := nest.NewStreamManager(
+	// Create multi-stream manager
+	streamMgr := nest.NewMultiStreamManager(
 		nestClient,
-		stream,
-		log.With("component", "stream-manager").Logger,
+		cfg.Google.ProjectID,
+		msmConfig,
+		logger.With("component", "stream_manager"),
 	)
-	streamMgr.Start()
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer stopCancel()
-		if err := streamMgr.Stop(stopCtx); err != nil {
-			log.Error("failed to stop stream manager", "error", err)
-		}
-	}()
 
-	// Create WebRTC bridge to Cloudflare
-	webrtcBridge, err := bridge.NewBridge(ctx, cfClient, log.With("component", "bridge").Logger)
-	if err != nil {
-		log.Error("failed to create bridge", "error", err)
-		os.Exit(1)
-	}
-	defer webrtcBridge.Close()
+	// Create multi-camera relay orchestrator
+	multiRelay := relay.NewMultiCameraRelay(
+		streamMgr,
+		cfClient,
+		logger.With("component", "multi_relay"),
+	)
 
-	// Create Cloudflare session and setup WebRTC
-	if err := webrtcBridge.CreateSession(ctx); err != nil {
-		log.Error("failed to create Cloudflare session", "error", err)
-		os.Exit(1)
-	}
+	logger.Info("multi-camera relay initialized",
+		"cameras", len(cameraIDs),
+		"qpm_limit", msmConfig.QPM,
+		"stagger_interval", msmConfig.StaggerInterval)
 
-	// Negotiate SDP with Cloudflare
-	if err := webrtcBridge.Negotiate(ctx); err != nil {
-		log.Error("failed to negotiate with Cloudflare", "error", err)
-		os.Exit(1)
+	// Create and start HTTP API server for viewer FIRST (before camera init)
+	apiServer := api.NewServer(
+		multiRelay,
+		cfClient,
+		cfg.Cloudflare.AppID,
+		logger.With("component", "api"),
+	)
+
+	// Set camera display names in the API server
+	for deviceID, name := range cameraNames {
+		apiServer.SetCameraName(deviceID, name)
 	}
 
-	log.Info("WebRTC bridge established",
-		"session_id", webrtcBridge.GetSessionID(),
-		"state", webrtcBridge.GetConnectionState().String())
-
-	// Create RTSP client
-	rtspConn := rtspClient.NewClient(stream.URL, log.With("component", "rtsp").Logger)
-
-	// Connect to RTSP server
-	if err := rtspConn.Connect(ctx); err != nil {
-		log.Error("failed to connect to RTSP server", "error", err)
-		os.Exit(1)
+	// Start HTTP server before cameras so viewer is available immediately
+	if err := apiServer.Start(ctx, ":8080"); err != nil {
+		log.Fatalf("Failed to start API server: %v", err)
 	}
-	defer rtspConn.Close()
+	logger.Info("API server started", "address", "http://localhost:8080")
 
-	// Setup RTP processors
-	h264Proc := rtp.NewH264Processor()
-	aacProc := rtp.NewAACProcessor()
-
-	// Packet counters for stats
-	var videoPacketCount, audioPacketCount atomic.Uint64
-	var videoFrameCount, audioFrameCount atomic.Uint64
-
-	// Setup H.264 frame handler
-	h264Proc.OnFrame = func(nalus []byte, keyframe bool) {
-		videoFrameCount.Add(1)
-
-		// Write to WebRTC bridge
-		// Note: For production, we'd use proper timing, but for POC we use fixed duration
-		if err := webrtcBridge.WriteVideoSample(nalus, 33*time.Millisecond); err != nil {
-			log.Warn("failed to write video sample", "error", err)
-		}
-
-		if videoFrameCount.Load()%30 == 0 { // Log every 30 frames (~1 second)
-			log.Debug("video frame written",
-				"frame_count", videoFrameCount.Load(),
-				"keyframe", keyframe,
-				"size_bytes", len(nalus))
-		}
+	// Start the multi-relay (starts stream manager internally)
+	if err := multiRelay.Start(ctx); err != nil {
+		log.Fatalf("Failed to start multi-relay: %v", err)
 	}
 
-	// Setup AAC frame handler
-	aacProc.OnFrame = func(frame []byte) {
-		audioFrameCount.Add(1)
+	// Start all cameras with staggered initialization
+	// This will take ~4 minutes for 20 cameras (20 * 12s stagger)
+	startCtx, startCancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer startCancel()
 
-		// Note: For production, AAC would need transcoding to Opus
-		// For now, we log but don't forward (Cloudflare expects Opus)
-		if audioFrameCount.Load()%100 == 0 { // Log every 100 frames
-			log.Debug("audio frame received",
-				"frame_count", audioFrameCount.Load(),
-				"size_bytes", len(frame))
-		}
-
-		// TODO: Transcode AAC to Opus and write to audio track
-		// For Phase 2 POC, we're focusing on video only
+	logger.Info("starting cameras with staggered initialization")
+	if err := streamMgr.StartCameras(startCtx, cameraIDs); err != nil {
+		log.Fatalf("Failed to start cameras: %v", err)
 	}
 
-	// Setup RTP packet handler with debug logging
-	rtspConn.OnRTPPacket = func(channel byte, packet *pionRTP.Packet) {
-		ch, ok := rtspConn.Channels[channel]
-		if !ok {
-			return
-		}
+	logger.Info("all cameras initialization triggered - relays will be created as streams become ready")
 
-		if ch.MediaType == "video" {
-			videoPacketCount.Add(1)
+	// Start monitoring goroutine
+	go monitorStatus(multiRelay, streamMgr, logger)
 
-			// Debug log RTP packet details if enabled
-			log.DebugRTPPacket(packet.SequenceNumber, packet.Timestamp, packet.PayloadType, len(packet.Payload))
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-			if err := h264Proc.ProcessPacket(packet); err != nil {
-				log.Warn("failed to process H.264 packet", "error", err)
-			}
-		} else if ch.MediaType == "audio" {
-			audioPacketCount.Add(1)
-			if err := aacProc.ProcessPacket(packet); err != nil {
-				log.Warn("failed to process AAC packet", "error", err)
-			}
-		}
+	logger.Info("running... press Ctrl+C to stop")
+	<-sigChan
+
+	logger.Info("shutdown signal received, stopping all relays")
+
+	// Graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// Stop API server
+	if err := apiServer.Stop(shutdownCtx); err != nil {
+		logger.Error("error stopping API server", "error", err)
 	}
 
-	// Setup all tracks
-	if err := rtspConn.SetupTracks(ctx); err != nil {
-		log.Error("failed to setup tracks", "error", err)
-		os.Exit(1)
+	// Stop relay
+	if err := multiRelay.Stop(); err != nil {
+		logger.Error("error during shutdown", "error", err)
 	}
 
-	// Start playing
-	if err := rtspConn.Play(ctx); err != nil {
-		log.Error("failed to start RTSP playback", "error", err)
-		os.Exit(1)
-	}
-
-	log.Info("RTSP playback started - streaming to Cloudflare")
-
-	// Start stats logger
-	statsTicker := time.NewTicker(10 * time.Second)
-	defer statsTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statsTicker.C:
-				log.Info("streaming statistics",
-					"video_packets", videoPacketCount.Load(),
-					"video_frames", videoFrameCount.Load(),
-					"audio_packets", audioPacketCount.Load(),
-					"audio_frames", audioFrameCount.Load(),
-					"webrtc_state", webrtcBridge.GetConnectionState().String(),
-					"stream_ttl", streamMgr.GetTimeUntilExpiry().String())
-			}
-		}
-	}()
-
-	// Read packets until context cancelled
-	log.Info("ready - press Ctrl+C to stop")
-	fmt.Println("\n✓ Phase 2 Complete - Full Pipeline Active:")
-	fmt.Printf("  - Camera: %s\n", displayName)
-	fmt.Printf("  - RTSP: %s\n", stream.URL)
-	fmt.Printf("  - Cloudflare Session: %s\n", webrtcBridge.GetSessionID())
-	fmt.Printf("  - Stream auto-extension: enabled\n")
-	fmt.Printf("  - Pipeline: RTSP → RTP → H.264 → WebRTC → Cloudflare\n\n")
-
-	if err := rtspConn.ReadPackets(ctx); err != nil && ctx.Err() == nil {
-		log.Error("error reading packets", "error", err)
-		os.Exit(1)
-	}
-
-	log.Info("graceful shutdown complete")
+	logger.Info("shutdown complete")
 }
+
+// monitorStatus periodically logs stream and relay status
+func monitorStatus(multiRelay *relay.MultiCameraRelay, streamMgr *nest.MultiStreamManager, logger *slog.Logger) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Get stream statuses
+		streamStatuses := streamMgr.GetStreamStatus()
+
+		// Count streams by state
+		streamStates := make(map[nest.CameraState]int)
+		for _, status := range streamStatuses {
+			streamStates[status.State]++
+		}
+
+		// Get relay stats
+		relayStats := multiRelay.GetRelayStats()
+		aggStats := multiRelay.GetAggregateStats()
+
+		// Get queue stats
+		queueStats := streamMgr.GetQueueStats()
+
+		logger.Info("status report",
+			// Stream states
+			"total_cameras", len(streamStatuses),
+			"streams_starting", streamStates[nest.StateStarting],
+			"streams_running", streamStates[nest.StateRunning],
+			"streams_failed", streamStates[nest.StateFailed],
+			"streams_degraded", streamStates[nest.StateDegraded],
+			"streams_stopped", streamStates[nest.StateStopped],
+			// Relay states
+			"total_relays", aggStats.TotalRelays,
+			"relays_connected", aggStats.ConnectedRelays,
+			"relays_connecting", aggStats.ConnectingRelays,
+			"relays_failed", aggStats.FailedRelays,
+			"relays_disconnected", aggStats.DisconnectedRelays,
+			// Aggregate statistics
+			"total_video_packets", aggStats.TotalVideoPackets,
+			"total_video_frames", aggStats.TotalVideoFrames,
+			"total_audio_packets", aggStats.TotalAudioPackets,
+			"total_audio_frames", aggStats.TotalAudioFrames,
+			// Queue statistics
+			"queue_depth", queueStats.QueueDepth,
+			"total_executed", queueStats.TotalExecuted,
+			"total_failed", queueStats.TotalFailed,
+			"extend_count", queueStats.ExtendCount,
+			"generate_count", queueStats.GenerateCount,
+			"avg_wait_time_ms", queueStats.AvgWaitTime.Milliseconds(),
+		)
+
+		// Log individual camera issues
+		for _, streamStatus := range streamStatuses {
+			if streamStatus.State == nest.StateFailed || streamStatus.State == nest.StateDegraded {
+				logger.Warn("camera stream issue",
+					"camera_id", streamStatus.CameraID,
+					"state", streamStatus.State.String(),
+					"failure_count", streamStatus.FailureCount,
+					"last_error", streamStatus.LastError,
+					"time_since_attempt", time.Since(streamStatus.LastAttempt),
+				)
+			}
+		}
+
+		// Log individual relay statistics
+		for _, stat := range relayStats {
+			if stat.WebRTCState != "connected" {
+				logger.Warn("relay connection issue",
+					"camera_id", stat.CameraID,
+					"session_id", stat.SessionID,
+					"webrtc_state", stat.WebRTCState,
+					"uptime", stat.Uptime,
+				)
+			}
+		}
+	}
+}
+
+// Architecture Notes:
+//
+// COMPONENT HIERARCHY:
+// MultiCameraRelay (orchestrator)
+//   ├─ MultiStreamManager (Nest stream lifecycle)
+//   │   ├─ CommandQueue (10 QPM rate limiting)
+//   │   └─ StreamManager per camera (auto-extension)
+//   │
+//   ├─ CameraRelay per camera (media pipeline)
+//   │   ├─ RTSP client (TCP interleaved)
+//   │   ├─ RTP processors (H.264, AAC)
+//   │   └─ WebRTC bridge (Cloudflare - producer)
+//   │
+//   └─ API Server (HTTP endpoints + web viewer)
+//       ├─ GET /api/cameras (session discovery)
+//       ├─ GET /api/config (Cloudflare app ID)
+//       └─ Viewer (browser) → Cloudflare (consumer)
+//
+// LIFECYCLE:
+// 1. MultiStreamManager starts cameras with 12s stagger
+// 2. Each stream → StateStarting → StateRunning
+// 3. MultiCameraRelay detects StateRunning → creates CameraRelay
+// 4. CameraRelay connects RTSP → processes RTP → sends to Cloudflare
+// 5. MultiStreamManager auto-extends streams every 180s
+// 6. If RTSP disconnect → MultiStreamManager regenerates stream
+// 7. If WebRTC disconnect → MultiCameraRelay recreates relay
+//
+// RATE LIMITING:
+// - 20 cameras × 1 generate = 20 queries (staggered over 4 minutes = 5 QPM)
+// - 20 cameras ÷ 4 minutes = 5 extensions per minute (steady state)
+// - Total: ~10 QPM (at Google's limit)
+// - Priority queue: extensions (HIGH) > generates (LOW)
+//
+// ERROR RECOVERY:
+// - Stream expired → regenerate (exponential backoff, max 5 retries)
+// - Too many failures → degraded state (5 minute retry interval)
+// - RTSP disconnect → stream manager handles regeneration
+// - WebRTC disconnect → relay recreates Cloudflare session
+//
+// GRACEFUL SHUTDOWN:
+// 1. Stop MultiCameraRelay (stops all relays + stream manager)
+// 2. Each CameraRelay: cancel context → close RTSP → wait goroutines → close WebRTC
+// 3. MultiStreamManager: stop all stream managers → stop queue
+// 4. Clean exit with no goroutine leaks
