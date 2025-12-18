@@ -49,6 +49,10 @@ type Bridge struct {
 	// Cached connection state (to avoid blocking on pc.ConnectionState())
 	connStateMu     sync.RWMutex
 	cachedConnState webrtc.PeerConnectionState
+
+	// Connection ready signal (for pacer to wait before starting)
+	connectedChan chan struct{}
+	connectedOnce sync.Once
 }
 
 // NewBridge creates a new WebRTC bridge to Cloudflare
@@ -64,6 +68,7 @@ func NewBridge(ctx context.Context, cameraID string, cfClient *cloudflare.Client
 		h264Payloader:   &codecs.H264Payloader{},
 		videoSeqNum:     uint16(time.Now().UnixNano() & 0xFFFF), // Random starting sequence number
 		cachedConnState: webrtc.PeerConnectionStateNew,          // Initial state
+		connectedChan:   make(chan struct{}),                    // Buffered to prevent blocking
 	}
 
 	// Create pacer for smooth packet transmission (report Section 8.2)
@@ -129,11 +134,23 @@ func (b *Bridge) CreateSession(ctx context.Context) error {
 	b.pc = pc
 
 	// Set up connection state change handler to cache state
+	// CRITICAL: Use work queue pattern to avoid blocking ICE agent (report Section 5.2)
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		// Update cached state
 		b.connStateMu.Lock()
 		b.cachedConnState = state
 		b.connStateMu.Unlock()
+
 		b.logger.Info("peer connection state changed", "state", state.String())
+
+		// Signal pacer when connection is ready (report Section 2.1)
+		// "The transition to Connected is the definitive 'green light' for calling WriteRTP"
+		if state == webrtc.PeerConnectionStateConnected {
+			b.connectedOnce.Do(func() {
+				b.logger.Info("connection established - signaling pacer to start")
+				close(b.connectedChan) // Signal pacer
+			})
+		}
 	})
 
 	// Create video track with unique name based on camera ID
@@ -275,14 +292,17 @@ func (b *Bridge) Negotiate(ctx context.Context) error {
 		"session_id", b.sessionID,
 		"tracks", len(tracksResp.Tracks))
 
-	// Start pacer now that WebRTC session is established
-	// Configure pacer callbacks to write to our tracks
+	// Configure pacer callbacks BEFORE starting (report Section 8.2)
 	b.pacer.SetWriteCallbacks(
-		b.writeVideoSampleDirect,   // Video write function
-		b.writeAudioSampleDirect,   // Audio write function
+		b.writeVideoSampleDirect, // Video write function
+		b.writeAudioSampleDirect, // Audio write function
 	)
-	b.pacer.Start()
-	b.logger.Info("pacer started - TCP bursts will be smoothed")
+
+	// Start pacer goroutines (they will wait for connection)
+	// CRITICAL: Pacer must wait for PeerConnectionStateConnected (report Section 2.1)
+	// "WriteRTP does not block waiting for network readiness. If called before
+	// ICE/DTLS ready, packets are silently dropped."
+	go b.startPacerWhenReady()
 
 	return nil
 }
@@ -531,6 +551,29 @@ func (b *Bridge) GetConnectionState() webrtc.PeerConnectionState {
 	b.connStateMu.RLock()
 	defer b.connStateMu.RUnlock()
 	return b.cachedConnState
+}
+
+// startPacerWhenReady waits for PeerConnectionStateConnected before starting pacer
+// Implements the "Decoupled Pacer Pattern" from report Section 7.2
+// This prevents packets from being silently dropped before ICE/DTLS is ready
+func (b *Bridge) startPacerWhenReady() {
+	b.logger.Info("waiting for PeerConnectionStateConnected before starting pacer")
+
+	// Wait for connection ready signal (with timeout)
+	select {
+	case <-b.connectedChan:
+		b.logger.Info("connection ready - starting pacer now")
+		b.pacer.Start()
+		b.logger.Info("pacer started - TCP bursts will be smoothed")
+
+	case <-time.After(30 * time.Second):
+		b.logger.Error("timeout waiting for PeerConnectionStateConnected - starting pacer anyway")
+		b.pacer.Start()
+
+	case <-b.ctx.Done():
+		b.logger.Info("context cancelled before connection ready")
+		return
+	}
 }
 
 // startRTCPReaders spawns goroutines to read RTCP feedback from Cloudflare
