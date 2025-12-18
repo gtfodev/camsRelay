@@ -18,6 +18,21 @@ export class Viewer {
         this.pc = null;
         this.trackMids = new Map(); // cameraId -> mid (for track updates)
         this.pendingTracks = new Map(); // trackName -> cameraId (to route ontrack events)
+
+        // Viewer identity for session reuse across refreshes
+        this.viewerId = this.getOrCreateViewerId();
+    }
+
+    getOrCreateViewerId() {
+        let id = sessionStorage.getItem('viewerId');
+        if (!id) {
+            id = crypto.randomUUID();
+            sessionStorage.setItem('viewerId', id);
+            console.log('[Viewer] Created new viewerId:', id);
+        } else {
+            console.log('[Viewer] Reusing viewerId:', id);
+        }
+        return id;
     }
 
     async start() {
@@ -65,23 +80,29 @@ export class Viewer {
     }
 
     async initSession() {
-        // Create ONE session
-        const response = await fetch('/api/cf/sessions/new', {
+        // Try to find/reuse existing session for this viewer
+        const response = await fetch('/api/viewer/session', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ viewerId: this.viewerId })
         });
 
         if (!response.ok) {
-            throw new Error(`Failed to create session: ${response.statusText}`);
+            throw new Error(`Failed to get session: ${response.statusText}`);
         }
 
         const data = await response.json();
         this.sessionId = data.sessionId;
-        console.log('[Viewer] Created single viewer session:', this.sessionId);
-        console.log(`[Viewer] ✓ Single session created: ${this.sessionId}`);
+
+        if (data.isExisting) {
+            console.log('[Viewer] ✓ Reusing existing session:', this.sessionId);
+            console.log('[Viewer] Session reuse saves ~2s of setup time');
+        } else {
+            console.log('[Viewer] ✓ Created new session:', this.sessionId);
+        }
         console.log(`[Viewer] Architecture: 1 session for ALL cameras (not 1 per camera)`);
 
-        // Create ONE PeerConnection
+        // Create ONE PeerConnection (always needed - browser state doesn't persist)
         this.pc = new RTCPeerConnection({
             iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
         });
@@ -200,6 +221,17 @@ export class Viewer {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tracks })
         });
+
+        // Handle expired session - recreate and retry
+        if (response.status === 404) {
+            console.warn('[Viewer] Session expired, recreating...');
+            // Clear cached session
+            this.sessionId = null;
+            // Reinitialize (will create new session)
+            await this.initSession();
+            // Retry track pull
+            return this.pullCameraTracks(camerasData);
+        }
 
         if (!response.ok) {
             throw new Error(`Failed to pull tracks: ${response.statusText}`);
