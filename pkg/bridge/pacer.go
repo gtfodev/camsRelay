@@ -53,6 +53,8 @@ type Pacer struct {
 	audioChan chan *PacedPacket
 
 	// Write callbacks (set by Bridge)
+	// Protected by callbackMu for memory visibility
+	callbackMu sync.RWMutex
 	writeVideo func(data []byte, timestamp uint32) error
 	writeAudio func(data []byte, timestamp uint32) error
 
@@ -94,10 +96,13 @@ func NewPacer(ctx context.Context, logger *slog.Logger) *Pacer {
 }
 
 // SetWriteCallbacks configures the output functions for paced packets
+// MUST be called before Start() to ensure proper initialization
 func (p *Pacer) SetWriteCallbacks(
 	writeVideo func(data []byte, timestamp uint32) error,
 	writeAudio func(data []byte, timestamp uint32) error,
 ) {
+	p.callbackMu.Lock()
+	defer p.callbackMu.Unlock()
 	p.writeVideo = writeVideo
 	p.writeAudio = writeAudio
 }
@@ -225,7 +230,17 @@ func (p *Pacer) paceVideoPacket(packet *PacedPacket) error {
 			"timestamp", packet.Timestamp,
 			"keyframe", packet.IsKeyframe)
 
-		if err := p.writeVideo(packet.NALUs, packet.Timestamp); err != nil {
+		// Get callback with proper synchronization
+		p.callbackMu.RLock()
+		writeVideoFn := p.writeVideo
+		p.callbackMu.RUnlock()
+
+		// Check for nil callback (should never happen, but defensive)
+		if writeVideoFn == nil {
+			return fmt.Errorf("writeVideo callback not set")
+		}
+
+		if err := writeVideoFn(packet.NALUs, packet.Timestamp); err != nil {
 			return fmt.Errorf("write first video packet: %w", err)
 		}
 
@@ -296,7 +311,18 @@ func (p *Pacer) paceVideoPacket(packet *PacedPacket) error {
 
 	// Send the packet
 	sendStart := time.Now()
-	if err := p.writeVideo(packet.NALUs, packet.Timestamp); err != nil {
+
+	// Get callback with proper synchronization
+	p.callbackMu.RLock()
+	writeVideoFn := p.writeVideo
+	p.callbackMu.RUnlock()
+
+	// Check for nil callback (should never happen, but defensive)
+	if writeVideoFn == nil {
+		return fmt.Errorf("writeVideo callback not set")
+	}
+
+	if err := writeVideoFn(packet.NALUs, packet.Timestamp); err != nil {
 		return fmt.Errorf("write video packet: %w", err)
 	}
 	sendDuration := time.Since(sendStart)
@@ -389,7 +415,17 @@ func (p *Pacer) paceAudioPacket(packet *PacedPacket) error {
 		p.logger.Info("[pacer:audio] first packet - establishing timeline",
 			"timestamp", packet.Timestamp)
 
-		if err := p.writeAudio(packet.NALUs, packet.Timestamp); err != nil {
+		// Get callback with proper synchronization
+		p.callbackMu.RLock()
+		writeAudioFn := p.writeAudio
+		p.callbackMu.RUnlock()
+
+		// Check for nil callback (should never happen, but defensive)
+		if writeAudioFn == nil {
+			return fmt.Errorf("writeAudio callback not set")
+		}
+
+		if err := writeAudioFn(packet.NALUs, packet.Timestamp); err != nil {
 			return fmt.Errorf("write first audio packet: %w", err)
 		}
 
@@ -439,7 +475,17 @@ func (p *Pacer) paceAudioPacket(packet *PacedPacket) error {
 	}
 
 	// Send the packet
-	if err := p.writeAudio(packet.NALUs, packet.Timestamp); err != nil {
+	// Get callback with proper synchronization
+	p.callbackMu.RLock()
+	writeAudioFn := p.writeAudio
+	p.callbackMu.RUnlock()
+
+	// Check for nil callback (should never happen, but defensive)
+	if writeAudioFn == nil {
+		return fmt.Errorf("writeAudio callback not set")
+	}
+
+	if err := writeAudioFn(packet.NALUs, packet.Timestamp); err != nil {
 		return fmt.Errorf("write audio packet: %w", err)
 	}
 
