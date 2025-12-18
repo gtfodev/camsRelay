@@ -217,10 +217,11 @@ func (s *Server) handleGetCameras(w http.ResponseWriter, r *http.Request) {
 				}
 
 				// Video track only (audio not currently populated)
+				// TrackName must match what bridge registers with Cloudflare: "{cameraID}-video"
 				cameras = append(cameras, CameraInfo{
 					CameraID:  stat.CameraID,
 					SessionID: stat.SessionID,
-					TrackName: "video",
+					TrackName: fmt.Sprintf("%s-video", stat.CameraID),
 					Name:      name,
 					Kind:      "video",
 				})
